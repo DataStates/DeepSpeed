@@ -95,3 +95,6 @@ class DeepSpeedZeroOffloadOptimizerConfig(DeepSpeedConfigModel):
 
     ratio: float = Field(1.0, ge=0.0, le=1.0)
     """ Percentage of offloaded optimizer states to CPU Adam. Only valid with ZeRO Stage 3."""
+
+    dynamic_offload_ratio: float = 0.0
+    """Dynamic offloading of optimizer computations for different pipeline stages"""

@@ -8,10 +8,11 @@ from types import MethodType
 import torch
 from deepspeed import comm as dist
 
-from deepspeed.utils import logger
+from deepspeed.utils import logger, instrument_w_nvtx
 from deepspeed.utils.timer import ThroughputTimer
 from deepspeed.accelerator import get_accelerator
 from deepspeed.runtime.bf16_optimizer import BF16_Optimizer
+from deepspeed.runtime.utils import see_memory_usage
 
 from ..engine import DeepSpeedEngine, MEMORY_OPT_ALLREDUCE_SIZE
 from deepspeed.utils.timer import FORWARD_MICRO_TIMER, FORWARD_GLOBAL_TIMER, BACKWARD_MICRO_TIMER, \
@@ -27,6 +28,7 @@ from ..activation_checkpointing import checkpointing as ds_checkpointing
 from .module import PipelineModule, PipelineError
 from . import p2p
 from . import schedule
+import time, sys
 
 TARGET_ID = -2
 LOG_STAGE = -2
@@ -365,9 +367,11 @@ class PipelineEngine(DeepSpeedEngine):
 
         # Do the work
         self.timers(TRAIN_BATCH_TIMER).start()
+        # logger.info(f"[Rank: {self.global_rank}] Before TrainSchedule at {time.time_ns()} to process stage_id {self.stage_id}")
         sched = schedule.TrainSchedule(micro_batches=self.micro_batches,
                                        stages=self.num_stages,
                                        stage_id=self.stage_id)
+        # logger.info(f"[Rank: {self.global_rank}] After TrainSchedule at {time.time_ns()} to process stage_id {self.stage_id}, sched: {type(sched)}")
         self._exec_schedule(sched)
         self.agg_train_loss = self._aggregate_total_loss()
 
@@ -648,6 +652,7 @@ class PipelineEngine(DeepSpeedEngine):
 
         return batch
 
+    @instrument_w_nvtx
     def _exec_forward_pass(self, buffer_id):
         self.tput_timer.start()
         self.mem_status('BEFORE FWD', reset_max=True)
@@ -727,18 +732,22 @@ class PipelineEngine(DeepSpeedEngine):
                 for idx, l in enumerate(self.loss):
                     self.total_loss[idx] += l.detach()
 
+    @instrument_w_nvtx
     def _exec_backward_pass(self, buffer_id):
         assert self.optimizer is not None, "must provide optimizer during " \
                                            "init in order to use backward"
 
         self.mem_status('BEFORE BWD', reset_max=True)
 
+        see_memory_usage(f"[{dist.get_rank()}] Engine before backward pass", force=self.memory_breakdown())
         # The last stage just runs backward on the loss using DeepSpeed's typical
         # mechanisms.
         if self.is_last_stage():
             super().backward(self.loss)
+            see_memory_usage(f"[{dist.get_rank()}] Engine After super backward pass", force=self.memory_breakdown())
             self.mem_status('AFTER BWD')
             return
+        
 
         outputs = self.pipe_buffers['outputs'][buffer_id]
 
@@ -764,6 +773,8 @@ class PipelineEngine(DeepSpeedEngine):
                 self.pipe_buffers['output_tensors'][buffer_id].data = outputs[0]
                 outputs = (self.pipe_buffers['output_tensors'][buffer_id], *outputs[1:])
 
+        see_memory_usage(f"[{dist.get_rank()}] Engine after pipeline partition backward pass", force=self.memory_breakdown())
+
         grad_tensors = self.grad_layer
         if self.is_grad_partitioned:
             #print(f'RANK={self.global_rank} BEFORE-BWD restoring grad={self.grad_layer[0].size()} {self.grad_layer[1].size()}')
@@ -775,10 +786,13 @@ class PipelineEngine(DeepSpeedEngine):
             grad_tensors = (part_grad.full(), *grad_tensors[2:])
             part_grad = None
             #print(f'RANK={self.global_rank} BEFORE-BWD restored grad={self.grad_layer[0].size()} {self.grad_layer[1].size()}')
+        
+        see_memory_usage(f"[{dist.get_rank()}] Engine after grad partition backward pass", force=self.memory_breakdown())
 
         if self.using_bf16_optimizer and not self.is_last_stage():
             # manually call because we don't call optimizer.backward()
             self.optimizer.clear_lp_grads()
+        see_memory_usage(f"[{dist.get_rank()}] Engine after clear lp grad backward pass", force=self.memory_breakdown())
 
         # This handles either a single tensor or tuple of tensors.
         if isinstance(outputs, tuple):
@@ -787,6 +801,8 @@ class PipelineEngine(DeepSpeedEngine):
             torch.autograd.backward(tensors=out_tensors, grad_tensors=grad_tensors)
         else:
             torch.autograd.backward(tensors=(outputs, ), grad_tensors=(grad_tensors, ))
+
+        see_memory_usage(f"[{dist.get_rank()}] Engine autograd backward pass", force=self.memory_breakdown())
 
         if self.using_bf16_optimizer and not self.is_last_stage():
             # manually call because we don't call optimizer.backward()
@@ -804,7 +820,12 @@ class PipelineEngine(DeepSpeedEngine):
             self.timers(BACKWARD_GLOBAL_TIMER).stop()
 
         self.mem_status('AFTER BWD')
+        see_memory_usage(f"[{dist.get_rank()}] Engine after full backward pass", force=self.memory_breakdown())
+            
 
+
+
+    @instrument_w_nvtx
     def _exec_load_micro_batch(self, buffer_id):
         if self.wall_clock_breakdown():
             self.timers(BATCH_INPUT_TIMER).start()
@@ -969,6 +990,7 @@ class PipelineEngine(DeepSpeedEngine):
         else:
             raise NotImplementedError(f'Could not receive type {type(recv_type)}')
 
+    @instrument_w_nvtx
     def _exec_send_activations(self, buffer_id):
         if self.wall_clock_breakdown():
             self.timers(PIPE_SEND_OUTPUT_TIMER).start()
@@ -1005,6 +1027,7 @@ class PipelineEngine(DeepSpeedEngine):
         if self.wall_clock_breakdown():
             self.timers(PIPE_SEND_OUTPUT_TIMER).stop()
 
+    @instrument_w_nvtx
     def _exec_send_grads(self, buffer_id):
         if self.wall_clock_breakdown():
             self.timers(PIPE_SEND_GRAD_TIMER).start()
@@ -1061,6 +1084,7 @@ class PipelineEngine(DeepSpeedEngine):
         if self.wall_clock_breakdown():
             self.timers(PIPE_SEND_GRAD_TIMER).stop()
 
+    @instrument_w_nvtx
     def _exec_recv_activations(self, buffer_id):
         if self.wall_clock_breakdown():
             self.timers(PIPE_RECV_INPUT_TIMER).start()
@@ -1104,6 +1128,7 @@ class PipelineEngine(DeepSpeedEngine):
         if self.wall_clock_breakdown():
             self.timers(PIPE_RECV_INPUT_TIMER).stop()
 
+    @instrument_w_nvtx
     def _exec_recv_grads(self, buffer_id):
         if self.wall_clock_breakdown():
             self.timers(PIPE_RECV_GRAD_TIMER).start()
@@ -1163,7 +1188,58 @@ class PipelineEngine(DeepSpeedEngine):
         if self.wall_clock_breakdown():
             self.timers(PIPE_RECV_GRAD_TIMER).stop()
 
+
+    def print_object_sizes(self, msg):
+        rank = dist.get_rank()
+        if rank != 0:
+            return
+
+        obj = self
+        seen_obj_ids = set()
+        seen_tensors = set()
+        seen_ids = set()
+        def get_object_size(obj):
+            nonlocal seen_ids, seen_tensors, seen_obj_ids
+            is_gpu = False
+            def _get_size(obj):
+                nonlocal is_gpu
+                if id(obj) in seen_obj_ids:
+                    return 0
+                seen_obj_ids.add(id(obj))
+                size = sys.getsizeof(obj)
+                if torch.is_tensor(obj):
+                    if obj.storage().data_ptr() in seen_tensors:
+                        return 0
+                    seen_tensors.add(obj.storage().data_ptr())
+                    size += obj.numel() * obj.element_size()
+                    if torch.device.type != 'cpu':
+                        is_gpu = True
+                elif isinstance(obj, dict):
+                    size += sum(_get_size(v) for v in obj.values())
+                elif hasattr(obj, '__dict__'):
+                    size += _get_size(obj.__dict__)
+                elif hasattr(obj, '__iter__') and not isinstance(obj, (str, bytes, bytearray)):
+                    size += sum(_get_size(i) for i in obj)
+                return size
+
+            return _get_size(obj), is_gpu   
+
+        
+        for attr_name in dir(obj):
+            attr = getattr(obj, attr_name)
+            if not attr_name.startswith('__') and not callable(attr) and id(attr) not in seen_ids and attr_name != 'data_iterator':
+                # logger.info(f"Going to check size of {attr_name}")
+                size, is_gpu = get_object_size(attr)
+                seen_ids.add(id(attr))
+                if size > 1024*1024: # Only greater than 1 MB things
+                    logger.info(f"[Rank {rank}] {msg} {attr_name}: {size/(1024**3)} GB")
+        del seen_obj_ids
+        del seen_tensors
+        del seen_ids
+
+    @instrument_w_nvtx
     def _exec_optimizer_step(self, lr_kwargs=None):
+        self.print_object_sizes("Before running _exec_optimizer_step")
         if self.wall_clock_breakdown():
             self.timers(STEP_MICRO_TIMER).start()
             self.timers(STEP_GLOBAL_TIMER).start()
