@@ -11,6 +11,7 @@ import hashlib
 from collections import defaultdict, OrderedDict, deque
 from shutil import copyfile
 import gc
+import numpy as np
 
 from torch.nn.modules import Module
 from torch.nn.parameter import Parameter
@@ -239,6 +240,7 @@ class DeepSpeedEngine(Module):
         self._configure_with_arguments(args, mpu)
         self._do_sanity_check()
         see_memory_usage(f"DeepSpeed Engine: After args sanity test", force=self.memory_breakdown())
+        
         if mpu is not None:
             if self.elasticity_enabled():
                 if not self.is_elastic_model_parallel_supported():
@@ -266,7 +268,7 @@ class DeepSpeedEngine(Module):
 
         self._get_model_parameters()
 
-        see_memory_usage(f"DeepSpeed Engine: After configure distributed model")
+        see_memory_usage(f"DeepSpeed Engine: After configure distributed model", force=self.memory_breakdown())
 
         # Configure wall clock timers
         self.timers = SynchronizedWallClockTimer()
@@ -298,13 +300,18 @@ class DeepSpeedEngine(Module):
         # If no parameters given by init default to module parameters
         if model_parameters is None:
             model_parameters = self.module.parameters()
+        see_memory_usage(f"DeepSpeed Engine: After setting model parameters", force=self.memory_breakdown())
+        
 
         # Convert model parameters from generator to list
         if not isinstance(model_parameters, list):
             model_parameters = list(model_parameters)
 
+
         if has_optimizer:
+            see_memory_usage(f"DeepSpeed Engine: Before configure optimizer", force=self.memory_breakdown())
             self._configure_optimizer(optimizer, model_parameters)
+            see_memory_usage(f"DeepSpeed Engine: Before configure LR scheduler", force=self.memory_breakdown())
             self._configure_lr_scheduler(lr_scheduler)
             self._report_progress(0)
         elif self.zero_optimization():
@@ -313,6 +320,7 @@ class DeepSpeedEngine(Module):
         elif self.bfloat16_enabled():
             self.optimizer = self._configure_bf16_optimizer(optimizer=None)
 
+        see_memory_usage(f"DeepSpeed Engine: Before rewriting optimizer step", force=self.memory_breakdown())
         # Hook optimizer for snip_momentum pruning
         if hasattr(model, 'pruners'):
             from ..compression.helper import rewrite_optimizer_step
@@ -329,6 +337,7 @@ class DeepSpeedEngine(Module):
 
         self.save_non_zero_checkpoint = False
         self.save_zero_checkpoint = False
+        see_memory_usage(f"DeepSpeed Engine: Before configure checkpointing", force=self.memory_breakdown())
         if not isinstance(self.optimizer, DeepSpeedZeRoOffload):
             self._configure_checkpointing(dist_init_required)
 
@@ -713,6 +722,14 @@ class DeepSpeedEngine(Module):
         if self._config.zero_config.offload_optimizer is not None:
             return self._config.zero_config.offload_optimizer.device == OffloadDeviceEnum.cpu
         return False
+
+    def zero_cpu_offload_dynamic(self):
+        if self._config.zero_config.offload_optimizer is not None:
+            return self._config.zero_config.offload_optimizer.dynamic_offload > 0
+        return False
+
+    def zero_prefetch_optimizer(self):
+        return getattr(self._config.zero_config.offload_optimizer, "prefetch_optimizer", False)
 
     def zero_partial_offload(self):
         return getattr(self._config.zero_config.offload_optimizer, "ratio", 1.0)
@@ -1514,6 +1531,7 @@ class DeepSpeedEngine(Module):
             assert not isinstance(optimizer, DummyOptim), "zero stage {} requires an optimizer".format(zero_stage)
 
             log_dist(f'Creating {model_dtype} ZeRO stage {zero_stage} optimizer', ranks=[0])
+            
 
             if isinstance(self.module, PipelineModule):
                 if overlap_comm:
@@ -1609,6 +1627,7 @@ class DeepSpeedEngine(Module):
                     offload_param_config=self.zero_offload_param(),
                     sub_group_size=self.zero_sub_group_size(),
                     offload_ratio=self.zero_partial_offload(),
+                    prefetch_optimizer=self.zero_prefetch_optimizer(),
                     mpu=self.mpu,
                     postscale_gradients=self.postscale_gradients(),
                     gradient_predivide_factor=self.gradient_predivide_factor(),
@@ -1804,6 +1823,8 @@ class DeepSpeedEngine(Module):
             **kwargs: variable length keyword arguments
         """
 
+
+        get_accelerator().empty_cache()
         if self.autotuning_profile_model_info():
             ma = get_ma_status()
         else:
@@ -1877,6 +1898,7 @@ class DeepSpeedEngine(Module):
             exit()
         else:
             see_memory_usage("Engine after forward", force=self.memory_breakdown())
+        get_accelerator().empty_cache()
         return loss
 
     def _cast_inputs_half(self, inputs):
@@ -1947,7 +1969,7 @@ class DeepSpeedEngine(Module):
             retain_graph: bool, default: false
                 forward on user defined choice of retain_graph
         """
-
+        get_accelerator().empty_cache()
         see_memory_usage("Engine before backward", force=self.memory_breakdown())
 
         if self.scale_wrt_gas is not None:
@@ -2017,7 +2039,8 @@ class DeepSpeedEngine(Module):
         if release_loss:
             # loss.data = None
             pass
-
+        
+        get_accelerator().empty_cache()
         see_memory_usage("Engine after backward", force=self.memory_breakdown())
 
         return loss
@@ -2072,6 +2095,7 @@ class DeepSpeedEngine(Module):
     def clip_fp32_gradients(self):
         clip_grad_norm_(parameters=self.module.parameters(), max_norm=self.gradient_clipping(), mpu=self.mpu)
 
+    @instrument_w_nvtx
     def _take_model_step(self, lr_kwargs, block_eigenvalue={}):
         if self.gradient_clipping() > 0.0:
             if not (self.fp16_enabled() or self.bfloat16_enabled() or self.amp_enabled() or self.zero_optimization()):
@@ -2081,6 +2105,7 @@ class DeepSpeedEngine(Module):
                 # https://nvidia.github.io/apex/advanced.html#gradient-clipping
                 master_params = amp.master_params(self.optimizer)
                 clip_grad_norm_(parameters=master_params, max_norm=self.gradient_clipping(), mpu=self.mpu)
+
         self.optimizer.step()
 
         if hasattr(self.optimizer, '_global_grad_norm'):
@@ -2142,7 +2167,7 @@ class DeepSpeedEngine(Module):
         r"""Execute the weight update step after forward and backward propagation
         on effective_train_batch.
         """
-        see_memory_usage("Engine before step", force=self.memory_breakdown())
+        get_accelerator().empty_cache()
 
         # Check early because self.global_steps is incremented at some point here.
         # TODO: Delay self.global_steps increment until very end of this function.
@@ -2242,6 +2267,7 @@ class DeepSpeedEngine(Module):
                 self.timers.log(self.engine_timers.global_timers)
 
         self.micro_steps += 1
+        get_accelerator().empty_cache()
         see_memory_usage("Engine after step", force=self.memory_breakdown())
 
     def _start_timers(self, timer_names):
