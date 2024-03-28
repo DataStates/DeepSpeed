@@ -163,19 +163,28 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
 
         self.offload_optimizer = False
         self.prefetch_optimizer = prefetch_optimizer
-        self.prefetch_optimizer_gap = 3
+        self.prefetch_optimizer_gap = 4
         self.prefetch_optimizer_decision = []
         self.prefetch_optimizer_stream = get_accelerator().Stream()
         self.prefetch_optimizer_subgroup_stat = {"prefetching": deque(), 
                                                  "prefetched": deque(), "flushing": deque(), 
                                                  "flushed": deque(), "futures": deque()}
         self.prefetch_optimizer_thread = ThreadPoolExecutor(max_workers=1)
-        self.prefetch_optimizer_fp32_params  = {}
-        self.prefetch_optimizer_fp32_step  = {}
-        self.prefetch_optimizer_fp32_momentum  = {}
-        self.prefetch_optimizer_fp32_variance  = {}
+        
+        self.prefetch_optimizer_fp32_steps  = {}
+        self.prefetch_optimizer_fp32_momentums  = {}
+        self.prefetch_optimizer_fp32_momentums  = {}
+        self.prefetch_optimizer_fp32_variances  = {}
+        self.prefetch_optimizer_gpu_fp32_params = None
+        self.prefetch_optimizer_gpu_fp32_grads  = {}
+        self.prefetch_optimizer_gpu_fp32_momentum = None
+        self.prefetch_optimizer_gpu_fp32_variance = None
+
+        self.prefetch_optimizer_copier_backup = AsyncCopierBuilder().load().async_copier()
+        self.prefetch_optimizer_stream = get_accelerator().Stream()
+        self.prefetch_optimizer_cpu_average_gradients = []
+
         self.prefetch_optimizer_copier = AsyncCopierBuilder().load().async_copier()
-        self.partition_name = {}
         self.offload_optimizer_pin_memory = False
         self.offload_optimizer_fast_init = False
         self.offload_param = False
@@ -883,9 +892,9 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
                     if self.prefetch_optimizer:
                         self.fp32_partitioned_groups_flat.append(self.fp16_partitioned_groups_flat[i].to(
                             self.subgroup_to_device[i]).clone().float().detach().pin_memory())
-                        # self.prefetch_optimizer_fp32_step[i] = torch.empty(1, device=self.device, dtype=torch.float32).pin_memory()
-                        # self.prefetch_optimizer_fp32_momentum[i] = torch.empty(num_elements, device=self.device, dtype=torch.float32).pin_memory()
-                        # self.prefetch_optimizer_fp32_variance[i] = torch.empty(num_elements, device=self.device, dtype=torch.float32).pin_memory()
+                        self.prefetch_optimizer_fp32_steps[i] = torch.zeros(1, device=self.device, dtype=torch.float32).pin_memory()
+                        self.prefetch_optimizer_fp32_momentums[i] = torch.empty(num_elements, device=self.device, dtype=torch.float32).pin_memory()
+                        self.prefetch_optimizer_fp32_variances[i] = torch.empty(num_elements, device=self.device, dtype=torch.float32).pin_memory()
                     elif self.offload_optimizer:
                         self.fp32_partitioned_groups_flat.append(self.fp16_partitioned_groups_flat[i].to(
                             self.subgroup_to_device[i]).clone().float().detach())
@@ -894,8 +903,7 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
                             self.device).clone().float().detach())
 
             self.fp32_partitioned_groups_flat[i].requires_grad = True  # keep this in case internal optimizer uses it
-            self.fp32_partitioned_groups_flat[i].ds_id = '_'.join(map(str, self.fp16_partitioned_groups_flat_id[i]))
-            self.partition_name[i] = self.fp32_partitioned_groups_flat[i].ds_id           
+            self.fp32_partitioned_groups_flat[i].ds_id = '_'.join(map(str, self.fp16_partitioned_groups_flat_id[i])) 
 
         if len(swappable_fp32_tensors) > 0:
             self.optimizer_swapper.initialize_parameters(parameters=swappable_fp32_tensors,
@@ -957,11 +965,16 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
         if self.contiguous_gradients:
             self.ipg_buffer = None
 
+    @instrument_w_nvtx
     def _optimizer_step(self, sub_group_id):
         param_group_id = self.sub_group_to_group_id[sub_group_id]
         fp32_param = self.fp32_partitioned_groups_flat[sub_group_id]
         if self.prefetch_optimizer and self.get_opt_update_device(sub_group_id) == PF_OPT_GPU_ONLY:            
-            gpu_loss = self.backup_optimizer.step()
+            self.prefetch_optimizer_stream.wait_stream(get_accelerator().default_stream())
+            with get_accelerator().stream(self.prefetch_optimizer_stream):
+                gpu_loss = self.backup_optimizer.step()
+            self.prefetch_optimizer_stream.synchronize()
+            # self.prefetch_optimizer_stream.wait_stream(get_accelerator().default_stream())
         elif self.offload_optimizer:
             cur_device = self.subgroup_to_device[sub_group_id]
             if cur_device == 'cpu':
@@ -1042,11 +1055,7 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
                 subgroup_gradient_buffer = torch.zeros(num_elements, dtype=gradient_dtype, device=self.device)
                 if self.offload_optimizer_pin_memory:
                     subgroup_gradient_buffer = get_accelerator().pin_memory(subgroup_gradient_buffer)
-                try:
-                    self.fp32_partitioned_groups_flat[i].grad = subgroup_gradient_buffer.to(self.subgroup_to_device[i])
-                except Exception as exc:
-                    logger.info(f"Error {exc}")
-                    import pdb; pdb.set_trace()
+                self.fp32_partitioned_groups_flat[i].grad = subgroup_gradient_buffer.to(self.subgroup_to_device[i])
             else:
                 self.fp32_partitioned_groups_flat[i].grad = gradient_buffer.narrow(0, 0, num_elements)
 
@@ -1126,7 +1135,7 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
 
         #in case of cpu offload, averaged gradients are already in fp32_partitioned_groups_flat.grad
         #TODO: use a similar code path for both cpu_offload and non-cpu offload
-        if (not self.offload_optimizer) or self.prefetch_optimizer:
+        if (not self.offload_optimizer): # or self.prefetch_optimizer:
             for i, sub_group in enumerate(self.fp16_groups):
                 #TODO: This is redundant
                 self.averaged_gradients[i] = [
@@ -1483,7 +1492,7 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
                 grad_buffer = cuda_grad_buffer
 
             # offload the gradient partition if applicable
-            if self.offload_optimizer and not self.prefetch_optimizer:
+            if self.offload_optimizer: # and not self.prefetch_optimizer:
                 i, dest_offset, _ = self.grad_position[self.get_param_id(param)]
 
                 if self.is_gradient_accumulation_boundary:
@@ -1496,10 +1505,18 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
 
                         offload_fp32_gradients[i].append(grad_buffer.float())
                         offload_fp32_offsets[i].append(dest_offset)
+                    elif self.prefetch_optimizer and self.get_opt_update_device(i) == PF_OPT_GPU_ONLY:
+                        if i not in self.prefetch_optimizer_gpu_fp32_grads:
+                            self.prefetch_optimizer_gpu_fp32_grads[i] = torch.empty(self.fp32_partitioned_groups_flat[i].shape, 
+                                                                                    dtype=self.gradient_accumulation_dtype, 
+                                                                                    device=get_accelerator().current_device_name())
+                        gpu_fp32_grad_tensor = self.prefetch_optimizer_gpu_fp32_grads[i].narrow(0, dest_offset, grad_buffer.numel())
+                        gpu_fp32_grad_tensor.copy_(grad_buffer, non_blocking=False)
                     else:
                         fp32_grad_tensor = self.fp32_partitioned_groups_flat[i].grad.narrow(
                             0, dest_offset, grad_buffer.numel())
-                        fp32_grad_tensor.copy_(grad_buffer)
+                        fp32_grad_tensor.copy_(grad_buffer, non_blocking=True)
+                    # import pdb; pdb.set_trace()
 
             # free the gradient
             if not get_accelerator().is_synchronized_device():
@@ -1872,7 +1889,7 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
     def _get_norm_groups(self):
         norm_groups = []
         for i, group in enumerate(self.fp16_groups):
-            if self.offload_optimizer and not self.prefetch_optimizer:
+            if self.offload_optimizer: #and not self.prefetch_optimizer:
                 norm_groups.append(self.complete_grad_norm_calculation_for_cpu_offload(self.fp16_groups[i]))
             elif self.prefetch_optimizer and self.get_opt_update_device(i) in (PF_OPT_CPU_ONLY, PF_OPT_CPU_PREF):
                 # logger.info(f"---------------Not getting averaged gradients for {i}: self.get_opt_update_device(i)")
@@ -1885,28 +1902,15 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
     @instrument_w_nvtx
     def _prepare_fp32_grad_for_sub_group(self, sub_group_id):
         partition_id = dist.get_rank(group=self.dp_process_group)
-        try:
-            logger.info(f"In prepare fp32 grad for subgroup: {sub_group_id}")
-            if self.prefetch_optimizer and self.get_opt_update_device(sub_group_id) == PF_OPT_GPU_ONLY:
-                for i, x in enumerate(self.averaged_gradients[sub_group_id]):
-                    if self.averaged_gradients[sub_group_id][i].device.type != get_accelerator()._name:
-                        self.averaged_gradients[sub_group_id][i] = self.averaged_gradients[sub_group_id][i].to(get_accelerator().current_device_name())
-            
-            single_grad_partition = self.flatten(self.averaged_gradients[sub_group_id]).to(
-                self.fp32_partitioned_groups_flat[sub_group_id].dtype)
 
-            assert single_grad_partition.numel() == self.fp32_partitioned_groups_flat[sub_group_id].numel(), \
-                "averaged gradients have different number of elements that partition size {} {} {} {}".format(
-                    single_grad_partition.numel(), self.fp32_partitioned_groups_flat[sub_group_id].numel(), sub_group_id, partition_id)         
-            if self.prefetch_optimizer and self.get_opt_update_device(sub_group_id) == PF_OPT_GPU_ONLY:
-                self.prefetch_optimizer_fp32_params[sub_group_id].grad = single_grad_partition
-                del single_grad_partition
-            else:
-                self.fp32_partitioned_groups_flat[sub_group_id].grad = single_grad_partition
-        except Exception as e:
-            logger.info(f"[Rank {dist.get_rank()}] Got error as {e}")
-            logger.info(f"Device are {[x.device.type for x in self.averaged_gradients[sub_group_id]]}")
-            import pdb; pdb.set_trace()
+        single_grad_partition = self.flatten(self.averaged_gradients[sub_group_id]).to(
+            self.fp32_partitioned_groups_flat[sub_group_id].dtype)
+
+        assert single_grad_partition.numel() == self.fp32_partitioned_groups_flat[sub_group_id].numel(), \
+            "averaged gradients have different number of elements that partition size {} {} {} {}".format(
+                single_grad_partition.numel(), self.fp32_partitioned_groups_flat[sub_group_id].numel(), sub_group_id, partition_id)
+
+        self.fp32_partitioned_groups_flat[sub_group_id].grad = single_grad_partition
 
         # release all the gradient since we have already created a necessary copy in dp_grad_partition
         self.zero_grad(set_to_none=True)
@@ -1922,8 +1926,8 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
         see_memory_usage(f'Before prepare optimizer sub group {sub_group_id}', force=False)
         if self._swappable_optimizer_subgroup(sub_group_id):
             self._optimizer_states_and_gradient_swap_in(sub_group_id, timer_names)
-        elif self.prefetch_optimizer and self.get_opt_update_device(sub_group_id) == PF_OPT_GPU_ONLY:
-            self._prepare_fp32_grad_for_sub_group(sub_group_id)
+        # elif self.prefetch_optimizer and self.get_opt_update_device(sub_group_id) == PF_OPT_GPU_ONLY:
+        #     self._prepare_fp32_grad_for_sub_group(sub_group_id)
         elif not self.offload_optimizer:
             self._prepare_fp32_grad_for_sub_group(sub_group_id)
         see_memory_usage(f'After prepare optimizer sub group {sub_group_id}', force=False)
@@ -1952,7 +1956,6 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
         if not self.offload_optimizer:
             self.fp32_partitioned_groups_flat[sub_group_id].grad = None
         if self.prefetch_optimizer:
-            
             get_accelerator().empty_cache()
 
         if self._swappable_optimizer_subgroup(sub_group_id):
@@ -2056,7 +2059,7 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
     @instrument_w_nvtx
     def _reassign_or_swap_out_partitioned_parameters(self, sub_group_id):
         if self.fp16_partitioned_groups_flat[sub_group_id] is not None:
-            if not (self.prefetch_optimizer and self.get_opt_update_device(sub_group_id) == PF_OPT_GPU_ONLY):
+            if not (self.prefetch_optimizer):
                 self.fp16_partitioned_groups_flat[sub_group_id].data.copy_(
                     self.fp32_partitioned_groups_flat[sub_group_id].data)
 
@@ -2072,102 +2075,78 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
         self.external_loss_scale = loss_scale
 
     @instrument_w_nvtx
-    def flush_opt_subgroup(self, sub_group_id):
-        if sub_group_id < 0 or sub_group_id >= len(self.fp16_groups):
-            return
-        to_device = 'cpu'            
-        # logger.info(f"[Rank {dist.get_rank()}] Flushing opt subgroup {sub_group_id}, prefetched: {self.prefetch_optimizer_subgroup_stat['prefetched']}")
-        # if len(self.prefetch_optimizer_subgroup_stat["prefetched"]):
-        #     assert sub_group_id == self.prefetch_optimizer_subgroup_stat["prefetched"].popleft(), f"Subgroup {sub_group_id} was not prefetched to the GPU"
-        assert sub_group_id in self.prefetch_optimizer_fp32_params, f"Subgroup {sub_group_id} not found in prefetch FP32 params"
-        assert len(self.backup_optimizer.state) == 1, f'Optimizer state contains more than one element {self.backup_optimizer.state}'
-
-        param_group_id = self.sub_group_to_group_id[sub_group_id]
-        self.prefetch_optimizer_fp32_params[sub_group_id].grad = None
-        self.fp32_partitioned_groups_flat[sub_group_id].grad = None
-        with get_accelerator().stream(self.prefetch_optimizer_stream):
-            t = time.time()
-            copy_list = []
-            # self.fp16_partitioned_groups_flat[sub_group_id].data.copy_(self.prefetch_optimizer_fp32_params[sub_group_id].data)
-            copy_list.append((self.fp16_partitioned_groups_flat[sub_group_id].data, self.prefetch_optimizer_fp32_params[sub_group_id].data))
-            # self.fp32_partitioned_groups_flat[sub_group_id].data.copy_(self.prefetch_optimizer_fp32_params[sub_group_id].data, non_blocking=True)
-            copy_list.append((self.fp32_partitioned_groups_flat[sub_group_id].data, self.prefetch_optimizer_fp32_params[sub_group_id].data))
-            logger.info(f"Time taken to flush only to FP32 partitioned group for {sub_group_id} is {time.time()-t} for {self.prefetch_optimizer_fp32_params[sub_group_id].numel()}")
-            to_del = []
-            for k, v in self.backup_optimizer.state.items():
-                if self.prefetch_optimizer_fp32_step.get(sub_group_id) is None:
-                    nele = self.backup_optimizer.state[k]['exp_avg'].numel()
-                    dtype = self.backup_optimizer.state[k]['exp_avg'].dtype
-                    self.prefetch_optimizer_fp32_step[sub_group_id] = self.backup_optimizer.state[k]['step'].pin_memory()
-                    self.prefetch_optimizer_fp32_momentum[sub_group_id] = torch.zeros(nele, dtype=dtype, device=to_device).pin_memory()
-                    self.prefetch_optimizer_fp32_variance[sub_group_id] = torch.zeros(nele, dtype=dtype, device=to_device).pin_memory()
-                    # import pdb; pdb.set_trace()
-
-                t = time.time()
-                self.prefetch_optimizer_fp32_step[sub_group_id] = self.backup_optimizer.state[k]['step']
-                # self.prefetch_optimizer_fp32_momentum[sub_group_id].data.copy_(self.backup_optimizer.state[k]['exp_avg'].data, non_blocking=True)
-                copy_list.append((self.prefetch_optimizer_fp32_momentum[sub_group_id].data, self.backup_optimizer.state[k]['exp_avg'].data))
-                # self.prefetch_optimizer_fp32_variance[sub_group_id].data.copy_(self.backup_optimizer.state[k]['exp_avg_sq'].data, non_blocking=True)
-                copy_list.append((self.prefetch_optimizer_fp32_variance[sub_group_id].data, self.backup_optimizer.state[k]['exp_avg_sq'].data))
-                logger.info(f"Time to flush out {sub_group_id} is {time.time()-t}")
-                to_del.append(k)
-            dest_tensors = [x[0] for x in copy_list]
-            src_tensors = [x[1] for x in copy_list]
-            self.prefetch_optimizer_copier.copy(dest_tensors, src_tensors)
-            t = time.time()
-            self.prefetch_optimizer_copier.wait()
-            while len(to_del) > 0:
-                k = to_del.pop()
-                del self.backup_optimizer.state[k]
-                del k
-            del self.backup_optimizer.param_groups[param_group_id]['params'][0]
-            self.backup_optimizer.state = defaultdict(dict)
-            self.prefetch_optimizer_fp32_params[sub_group_id] = None
-            self.backup_optimizer.param_groups[param_group_id]['params'] = []
-            # self.prefetch_optimizer_subgroup_stat["flushed"].append(sub_group_id)
-            # self.prefetch_optimizer_subgroup_stat["flushing"].popleft()
-            logger.info(f"Time outside in the delete stage of subgroup {sub_group_id} is {time.time()-t}")
-
-    @instrument_w_nvtx
-    def prefetch_opt_subgroup(self, sub_group_id):
-        if sub_group_id <0 or sub_group_id >= len(self.fp16_groups):
-            return
-        # logger.info(f"[Rank {dist.get_rank()}] Prefetching opt subgroup {sub_group_id}")
-        to_device = get_accelerator().current_device_name()
-        param_group_id = self.sub_group_to_group_id[sub_group_id]
-        # self.prefetch_optimizer_subgroup_stat["prefetching"].append(sub_group_id)
-        with get_accelerator().stream(self.prefetch_optimizer_stream):
-            # t = time.time()
-            if param_group_id in self.backup_optimizer.param_groups[param_group_id] and \
-                len(self.backup_optimizer.param_groups[param_group_id]['params']) > 0:
-                self.prefetch_optimizer_stream.synchronize()
-            
-            self.prefetch_optimizer_fp32_params[sub_group_id] = self.fp32_partitioned_groups_flat[sub_group_id].detach().to(to_device)
-            self.prefetch_optimizer_fp32_params[sub_group_id].requires_grad = True
-            fp32_params = self.prefetch_optimizer_fp32_params[sub_group_id]
-            self.backup_optimizer.param_groups[param_group_id]['params'] = [fp32_params]
-            self.backup_optimizer.state = defaultdict(dict)
-            if sub_group_id in self.prefetch_optimizer_fp32_step:
-                self.backup_optimizer.state[fp32_params]['step'] = self.prefetch_optimizer_fp32_step[sub_group_id]
-                self.backup_optimizer.state[fp32_params]['exp_avg'] = self.prefetch_optimizer_fp32_momentum[sub_group_id].to(to_device, non_blocking=True)
-                self.backup_optimizer.state[fp32_params]['exp_avg_sq'] = self.prefetch_optimizer_fp32_variance[sub_group_id].to(to_device, non_blocking=True)
-            try:
-                for i, x in enumerate(self.averaged_gradients[sub_group_id]):
-                    self.averaged_gradients[sub_group_id][i] = self.averaged_gradients[sub_group_id][i].to(to_device, non_blocking=True)
-            except Exception as exc:
-                logger.info(f"Got exception in prefetch opt subgroup {exc}")
-                import pdb; pdb.set_trace()
-        # self.prefetch_optimizer_subgroup_stat["prefetched"].append(sub_group_id)
-        # self.prefetch_optimizer_subgroup_stat["prefetching"].popleft()
-        self.prefetch_optimizer_stream.synchronize()
-        # logger.info(f"Time taken to prefetch subgroup {sub_group_id} is {time.time()-t}")
-
     def opt_transfers(self, sub_group_id):
         prev_on_gpu = self.get_prev_next_subgroup_on_gpu(sub_group_id, prev=True)
-        self.flush_opt_subgroup(prev_on_gpu)
         next_on_gpu = self.get_prev_next_subgroup_on_gpu(sub_group_id, prev=False)
-        self.prefetch_opt_subgroup(next_on_gpu)
-        self.prefetch_optimizer_stream.synchronize()
+        copy_list = []
+        to_del = []
+        t = time.time()
+        if (prev_on_gpu >= 0) and (prev_on_gpu < len(self.fp16_groups)):
+            to_device = 'cpu'
+            assert self.prefetch_optimizer_gpu_fp32_params is not None, f"GPU FP32 params are None"
+            assert len(self.backup_optimizer.state) == 1, f'Optimizer state contains more than one element {self.backup_optimizer.state}'
+            param_group_id = self.sub_group_to_group_id[prev_on_gpu]
+            self.prefetch_optimizer_gpu_fp32_params.grad = None
+            # self.fp32_partitioned_groups_flat[prev_on_gpu].grad = None            
+            
+            # Copy the FP32 GPU optimizer params from the optimizer to FP16 params on the GPU for training
+            copy_list.append((self.fp16_partitioned_groups_flat[prev_on_gpu].data, self.prefetch_optimizer_gpu_fp32_params.data))
+            # Copy the FP32 GPU optimizer params to FP32 CPU optmizer params
+            copy_list.append((self.fp32_partitioned_groups_flat[prev_on_gpu].data, self.prefetch_optimizer_gpu_fp32_params.data))
+            
+            for k, v in self.backup_optimizer.state.items():
+                if self.prefetch_optimizer_fp32_steps.get(prev_on_gpu) is None:
+                    nele = self.backup_optimizer.state[k]['exp_avg'].numel()
+                    dtype = self.backup_optimizer.state[k]['exp_avg'].dtype
+                    self.prefetch_optimizer_fp32_steps[prev_on_gpu] = self.backup_optimizer.state[k]['step'].pin_memory()
+                    self.prefetch_optimizer_fp32_momentums[prev_on_gpu] = torch.zeros(nele, dtype=dtype, device=to_device).pin_memory()
+                    self.prefetch_optimizer_fp32_variances[prev_on_gpu] = torch.zeros(nele, dtype=dtype, device=to_device).pin_memory()
+                self.prefetch_optimizer_fp32_steps[prev_on_gpu].copy_(self.backup_optimizer.state[k]['step'])
+                self.prefetch_optimizer_gpu_fp32_momentum = self.backup_optimizer.state[k]['exp_avg'].data
+                self.prefetch_optimizer_gpu_fp32_variance = self.backup_optimizer.state[k]['exp_avg_sq'].data
+                copy_list.append((self.prefetch_optimizer_fp32_momentums[prev_on_gpu].data, self.prefetch_optimizer_gpu_fp32_momentum.data))
+                copy_list.append((self.prefetch_optimizer_fp32_variances[prev_on_gpu].data, self.prefetch_optimizer_gpu_fp32_variance.data))
+                to_del.append(k)
+                
+                
+        if (next_on_gpu >= 0) and (next_on_gpu < len(self.fp16_groups)):
+            to_device = get_accelerator().current_device_name()
+            nele = self.fp32_partitioned_groups_flat[next_on_gpu].shape
+            dtype = self.fp32_partitioned_groups_flat[next_on_gpu].dtype
+            if self.prefetch_optimizer_gpu_fp32_params == None or self.prefetch_optimizer_gpu_fp32_params.shape != nele:
+                self.prefetch_optimizer_gpu_fp32_params = torch.empty(nele, dtype=dtype, device=to_device, requires_grad = True)
+                self.prefetch_optimizer_gpu_fp32_momentum = torch.empty(nele, dtype=dtype, device=to_device, requires_grad = False)
+                self.prefetch_optimizer_gpu_fp32_variance = torch.empty(nele, dtype=dtype, device=to_device, requires_grad = True)
+            
+            self.prefetch_optimizer_gpu_fp32_params.grad = self.prefetch_optimizer_gpu_fp32_grads[next_on_gpu].to(dtype)
+            del self.prefetch_optimizer_gpu_fp32_grads[next_on_gpu]
+        
+            assert self.fp32_partitioned_groups_flat[next_on_gpu] is not None, f"Subgroup {next_on_gpu} not found in FP32 partitioned flat groups"
+            assert next_on_gpu in self.prefetch_optimizer_fp32_momentums, f"Subgroup {next_on_gpu} not found in FP32 momentums"
+            assert next_on_gpu in self.prefetch_optimizer_fp32_variances, f"Subgroup {next_on_gpu} not found in FP32 momentums"            
+
+            copy_list.append((self.prefetch_optimizer_gpu_fp32_params.data, self.fp32_partitioned_groups_flat[next_on_gpu].data))
+            copy_list.append((self.prefetch_optimizer_gpu_fp32_momentum.data, self.prefetch_optimizer_fp32_momentums[next_on_gpu].data))
+            copy_list.append((self.prefetch_optimizer_gpu_fp32_variance.data, self.prefetch_optimizer_fp32_variances[next_on_gpu].data))
+
+            dest_tensors = [x[0].data_ptr() for x in copy_list]
+            src_tensors = [x[1].data_ptr() for x in copy_list]
+            sizes = [min(x[0].numel(), x[1].numel())*x[0].element_size() for x in copy_list]
+            copy_list = []
+            
+
+            self.prefetch_optimizer_copier.copy(src_tensors, dest_tensors, sizes)
+            
+            
+            logger.info(f"Time to flush out subgroup {prev_on_gpu} is {time.time()-t}")
+
+        if len(copy_list) > 0:      # Need to flush out the last subgroup
+            dest_tensors = [x[0].data_ptr() for x in copy_list]
+            src_tensors = [x[1].data_ptr() for x in copy_list]
+            sizes = [min(x[0].numel(), x[1].numel())*x[0].element_size() for x in copy_list]
+            self.prefetch_optimizer_copier.copy(src_tensors, dest_tensors, sizes)
+            self.prefetch_optimizer_copier.wait()
+        
         return True
 
     def get_prev_next_subgroup_on_gpu(self, sub_group_id, prev=False):
@@ -2179,16 +2158,16 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
         return sub_group_id
     
     def get_opt_update_device(self, sub_group_id):
+        
         if len(self.prefetch_optimizer_decision) == len(self.fp16_groups):
             return self.prefetch_optimizer_decision[sub_group_id]
-        
+
+        self.prefetch_optimizer_decision = [PF_OPT_CPU_ONLY for _ in range(len(self.fp16_groups))]
         for x in range(len(self.fp16_groups)):
-            if x!=0 and x%self.prefetch_optimizer_gap == 0:
-                self.prefetch_optimizer_decision.append(PF_OPT_GPU_ONLY)
-            elif x%self.prefetch_optimizer_gap == 1:
-                self.prefetch_optimizer_decision.append(PF_OPT_CPU_PREF)
-            else:
-                self.prefetch_optimizer_decision.append(PF_OPT_CPU_ONLY)
+            if x%self.prefetch_optimizer_gap == 0:
+                self.prefetch_optimizer_decision[x] = PF_OPT_CPU_PREF
+            elif (x+1)%self.prefetch_optimizer_gap == 0:
+                self.prefetch_optimizer_decision[x] = PF_OPT_GPU_ONLY
             
         return self.prefetch_optimizer_decision[sub_group_id]
 
@@ -2197,6 +2176,7 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
         """
             Not supporting closure.
         """
+        get_accelerator().default_stream().synchronize()
         self._pre_step()
         self._partition_all_parameters()
 
@@ -2219,50 +2199,60 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
         force_mem_ctr = False
         
         t_outer = time.time()
+        later_release = []
         #update parameters one sub group at a time
         for sub_group_id, group in enumerate(self.fp16_groups):
             t = time.time()
             # If this runs on the CPU, then start prefetching next
             if self.prefetch_optimizer and self.get_opt_update_device(sub_group_id) == PF_OPT_CPU_PREF:
-                f = self.prefetch_optimizer_thread.submit(self.opt_transfers, sub_group_id)
-                self.prefetch_optimizer_subgroup_stat["futures"].append(f)
-                logger.info(f"Subgroup {sub_group_id} running on the CPU, time to flush and prefetch GPU ones {time.time()-t}")
+                self.opt_transfers(sub_group_id)
             # Run this on the GPU
             elif self.prefetch_optimizer and self.get_opt_update_device(sub_group_id) == PF_OPT_GPU_ONLY:
-                f = self.prefetch_optimizer_subgroup_stat["futures"].popleft()
-                res = f.result()
-                self.prefetch_optimizer_stream.synchronize()
-                # get_accelerator().default_stream().wait_stream(self.reduce_and_partition_stream)
-                # get_accelerator().default_stream().wait_stream(self.prefetch_optimizer_stream)
-                logger.info(f"[Rank {dist.get_rank()}] Subgroup {sub_group_id} running on the GPU")
+                self.prefetch_optimizer_copier.wait()
+                param_group_id = self.sub_group_to_group_id[sub_group_id]
+                del self.backup_optimizer.param_groups[param_group_id]['params'][0]
+                while len(self.backup_optimizer.state.keys()) > 0:
+                    k = list(self.backup_optimizer.state.keys())[0]
+                    del self.backup_optimizer.state[k]
+                self.backup_optimizer.param_groups[param_group_id]['params'] = [self.prefetch_optimizer_gpu_fp32_params]
 
+                self.backup_optimizer.state[self.prefetch_optimizer_gpu_fp32_params] = defaultdict(dict)
+                self.backup_optimizer.state[self.prefetch_optimizer_gpu_fp32_params]["step"] = self.prefetch_optimizer_fp32_steps[sub_group_id]
+                self.backup_optimizer.state[self.prefetch_optimizer_gpu_fp32_params]["exp_avg"] = self.prefetch_optimizer_gpu_fp32_momentum
+                self.backup_optimizer.state[self.prefetch_optimizer_gpu_fp32_params]["exp_avg_sq"] = self.prefetch_optimizer_gpu_fp32_variance
+        
             #prepare optimizer states, gradients and fp32 parameters for update
             self._prepare_sub_group(sub_group_id, timer_names)
 
             #scale the fp32 gradients
             self.unscale_and_clip_grads(sub_group_id, scaled_global_grad_norm)
-            see_memory_usage(f'[Rank {dist.get_rank()}] After unscale and clip grads step {sub_group_id}, prefetch_optimizer {self.prefetch_optimizer}', force=force_mem_ctr)
 
             #apply the optimizer step on the sub group and copy fp32 parameters to fp16
             self._optimizer_step(sub_group_id)
-            see_memory_usage(f'[Rank {dist.get_rank()}] After optimizer step {sub_group_id}, prefetch_optimizer {self.prefetch_optimizer}', force=force_mem_ctr)
-            # import pdb; pdb.set_trace()
+            
+            if self.prefetch_optimizer and self.get_opt_update_device(sub_group_id) in (PF_OPT_CPU_ONLY, PF_OPT_CPU_PREF):
+                src_ptr = self.fp32_partitioned_groups_flat[sub_group_id].data.data_ptr()
+                dest_ptr = self.fp16_partitioned_groups_flat[sub_group_id].data.data_ptr()
+                size =  self.fp16_partitioned_groups_flat[sub_group_id].numel()*self.fp16_partitioned_groups_flat[sub_group_id].element_size()
+                self.prefetch_optimizer_copier_backup.copy([src_ptr], [dest_ptr], [size])
+                later_release.append(sub_group_id)
+                continue
 
             #put fp16 parameters in appropriate location
             self._reassign_or_swap_out_partitioned_parameters(sub_group_id)
-            see_memory_usage(f'[Rank {dist.get_rank()}] After reassign step {sub_group_id}, prefetch_optimizer {self.prefetch_optimizer}', force=force_mem_ctr)
 
             #release memory or swap out optimizer states of fp32 parameters
             self._release_sub_group(sub_group_id, timer_names)
-            see_memory_usage(f'[Rank {dist.get_rank()}] After release subgroup step {sub_group_id}, prefetch_optimizer {self.prefetch_optimizer}', force=force_mem_ctr)
 
-            logger.info(f"[Rank {dist.get_rank()}] Subgroup {sub_group_id} ran in {time.time()-t}")
+        logger.info(f"With missing steps outer loop took {time.time()-t_outer}")   
+        self.prefetch_optimizer_copier_backup.wait()
+        for sub_group_id in later_release:
+            #put fp16 parameters in appropriate location
+            self._reassign_or_swap_out_partitioned_parameters(sub_group_id)
+            #release memory or swap out optimizer states of fp32 parameters
+            self._release_sub_group(sub_group_id, timer_names)
 
-            # if dist.get_rank() == 3:
-            # dist.barrier()
-        logger.info(f"Outer step loop took {time.time()-t_outer}")
-        while len(self.prefetch_optimizer_subgroup_stat["prefetched"]):
-            self.flush_opt_subgroup(self.prefetch_optimizer_subgroup_stat["prefetched"][0])
+        logger.info(f"Full outer step loop took {time.time()-t_outer}")    
             
 
         self.timers(OPTIMIZER_STEP_TIMER).stop()
@@ -2327,7 +2317,7 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
             if clip > 1:
                 combined_scale = clip * self.loss_scale
         if self.prefetch_optimizer and self.get_opt_update_device(sub_group_id) == PF_OPT_GPU_ONLY:
-            self.prefetch_optimizer_fp32_params[sub_group_id].grad.mul_(1. / combined_scale)
+            self.prefetch_optimizer_gpu_fp32_params.grad.mul_(1. / combined_scale)
         else:
             self.fp32_partitioned_groups_flat[sub_group_id].grad.mul_(1. / combined_scale)
 
