@@ -98,3 +98,9 @@ class DeepSpeedZeroOffloadOptimizerConfig(DeepSpeedConfigModel):
     
     prefetch_optimizer: bool = False
     """AM: Swap the optimizer in/out of the GPU for faster computation of ZeRO-3 updates"""
+
+    part_grads_async: bool = False
+    """AM: Swap out the optimizer to host after the gradient reduction in async fashion"""
+
+    prefetch_optimizer_gap: int = 0
+    """AM: Gap after which we run the subgroup update on GPU """

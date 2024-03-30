@@ -113,6 +113,8 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
         sub_group_size=1000000000000,
         offload_ratio=0.0,
         prefetch_optimizer=False,
+        part_grad_async=False,
+        prefetch_optimizer_gap=0,
         mpu=None,
         clip_grad=0.0,
         gradient_accumulation_dtype=torch.float32,
@@ -163,7 +165,8 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
 
         self.offload_optimizer = False
         self.prefetch_optimizer = prefetch_optimizer
-        self.prefetch_optimizer_gap = 4
+        self.prefetch_optimizer_gap = prefetch_optimizer_gap
+        self.part_grad_async = part_grad_async
         self.prefetch_optimizer_decision = []
         self.prefetch_optimizer_stream = get_accelerator().Stream()
         self.prefetch_optimizer_subgroup_stat = {"prefetching": deque(), 
@@ -1515,9 +1518,8 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
                     else:
                         fp32_grad_tensor = self.fp32_partitioned_groups_flat[i].grad.narrow(
                             0, dest_offset, grad_buffer.numel())
-                        fp32_grad_tensor.copy_(grad_buffer, non_blocking=True)
-                    # import pdb; pdb.set_trace()
-
+                        fp32_grad_tensor.copy_(grad_buffer, non_blocking=self.part_grad_async)
+                    
             # free the gradient
             if not get_accelerator().is_synchronized_device():
                 param.grad.record_stream(get_accelerator().current_stream())
@@ -1955,8 +1957,6 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
         # get rid of the fp32 gradients. Not needed anymore
         if not self.offload_optimizer:
             self.fp32_partitioned_groups_flat[sub_group_id].grad = None
-        if self.prefetch_optimizer:
-            get_accelerator().empty_cache()
 
         if self._swappable_optimizer_subgroup(sub_group_id):
             self._optimizer_states_and_gradient_swap_out(sub_group_id, timer_names)
@@ -2080,14 +2080,12 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
         next_on_gpu = self.get_prev_next_subgroup_on_gpu(sub_group_id, prev=False)
         copy_list = []
         to_del = []
-        t = time.time()
+        
         if (prev_on_gpu >= 0) and (prev_on_gpu < len(self.fp16_groups)):
             to_device = 'cpu'
             assert self.prefetch_optimizer_gpu_fp32_params is not None, f"GPU FP32 params are None"
             assert len(self.backup_optimizer.state) == 1, f'Optimizer state contains more than one element {self.backup_optimizer.state}'
-            param_group_id = self.sub_group_to_group_id[prev_on_gpu]
-            self.prefetch_optimizer_gpu_fp32_params.grad = None
-            # self.fp32_partitioned_groups_flat[prev_on_gpu].grad = None            
+            self.prefetch_optimizer_gpu_fp32_params.grad = None        
             
             # Copy the FP32 GPU optimizer params from the optimizer to FP16 params on the GPU for training
             copy_list.append((self.fp16_partitioned_groups_flat[prev_on_gpu].data, self.prefetch_optimizer_gpu_fp32_params.data))
@@ -2137,9 +2135,6 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
 
             self.prefetch_optimizer_copier.copy(src_tensors, dest_tensors, sizes)
             
-            
-            logger.info(f"Time to flush out subgroup {prev_on_gpu} is {time.time()-t}")
-
         if len(copy_list) > 0:      # Need to flush out the last subgroup
             dest_tensors = [x[0].data_ptr() for x in copy_list]
             src_tensors = [x[1].data_ptr() for x in copy_list]
@@ -2176,6 +2171,7 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
         """
             Not supporting closure.
         """
+        get_accelerator().empty_cache()
         get_accelerator().default_stream().synchronize()
         self._pre_step()
         self._partition_all_parameters()
