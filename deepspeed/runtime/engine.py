@@ -731,6 +731,13 @@ class DeepSpeedEngine(Module):
     def zero_prefetch_optimizer(self):
         return getattr(self._config.zero_config.offload_optimizer, "prefetch_optimizer", False)
 
+    def zero_part_grads_async(self):
+        return getattr(self._config.zero_config.offload_optimizer, "part_grads_async", False)
+
+    def zero_prefetch_optimizer_gap(self):
+        return getattr(self._config.zero_config.offload_optimizer, "prefetch_optimizer_gap", 0)
+    
+
     def zero_partial_offload(self):
         return getattr(self._config.zero_config.offload_optimizer, "ratio", 1.0)
 
@@ -1628,6 +1635,8 @@ class DeepSpeedEngine(Module):
                     sub_group_size=self.zero_sub_group_size(),
                     offload_ratio=self.zero_partial_offload(),
                     prefetch_optimizer=self.zero_prefetch_optimizer(),
+                    prefetch_optimizer_gap=self.zero_prefetch_optimizer_gap(),
+                    part_grads_async=self.zero_part_grads_async(),
                     mpu=self.mpu,
                     postscale_gradients=self.postscale_gradients(),
                     gradient_predivide_factor=self.gradient_predivide_factor(),
@@ -2168,6 +2177,7 @@ class DeepSpeedEngine(Module):
         on effective_train_batch.
         """
         get_accelerator().empty_cache()
+        see_memory_usage("Engine before step", force=self.memory_breakdown())
 
         # Check early because self.global_steps is incremented at some point here.
         # TODO: Delay self.global_steps increment until very end of this function.
