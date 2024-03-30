@@ -113,7 +113,7 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
         sub_group_size=1000000000000,
         offload_ratio=0.0,
         prefetch_optimizer=False,
-        part_grad_async=False,
+        part_grads_async=False,
         prefetch_optimizer_gap=0,
         mpu=None,
         clip_grad=0.0,
@@ -166,7 +166,7 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
         self.offload_optimizer = False
         self.prefetch_optimizer = prefetch_optimizer
         self.prefetch_optimizer_gap = prefetch_optimizer_gap
-        self.part_grad_async = part_grad_async
+        self.part_grads_async = part_grads_async
         self.prefetch_optimizer_decision = []
         self.prefetch_optimizer_stream = get_accelerator().Stream()
         self.prefetch_optimizer_subgroup_stat = {"prefetching": deque(), 
@@ -1518,7 +1518,7 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
                     else:
                         fp32_grad_tensor = self.fp32_partitioned_groups_flat[i].grad.narrow(
                             0, dest_offset, grad_buffer.numel())
-                        fp32_grad_tensor.copy_(grad_buffer, non_blocking=self.part_grad_async)
+                        fp32_grad_tensor.copy_(grad_buffer, non_blocking=self.part_grads_async)
                     
             # free the gradient
             if not get_accelerator().is_synchronized_device():
