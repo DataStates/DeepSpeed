@@ -169,10 +169,6 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
         self.part_grads_async = part_grads_async
         self.prefetch_optimizer_decision = []
         self.prefetch_optimizer_stream = get_accelerator().Stream()
-        self.prefetch_optimizer_subgroup_stat = {"prefetching": deque(), 
-                                                 "prefetched": deque(), "flushing": deque(), 
-                                                 "flushed": deque(), "futures": deque()}
-        self.prefetch_optimizer_thread = ThreadPoolExecutor(max_workers=1)
         
         self.prefetch_optimizer_fp32_steps  = {}
         self.prefetch_optimizer_fp32_momentums  = {}
