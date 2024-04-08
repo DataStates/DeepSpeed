@@ -34,7 +34,7 @@ from deepspeed.checkpoint import enable_universal_checkpoint
 from deepspeed.utils import groups
 import sys
 from deepspeed.ops.op_builder import AsyncCopierBuilder
-import math
+import math, time
 # Toggle this to true to enable correctness test
 # with gradient partitioning and without
 pg_correctness_test = False
@@ -2001,12 +2001,13 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
 
             nele = self.single_partition_of_fp32_groups[i][start_offset:end_offset].shape
             dtype = self.single_partition_of_fp32_groups[i][start_offset:end_offset].dtype
+            
             if self.prefetch_optimizer_gpu_fp32_params == None or self.prefetch_optimizer_gpu_fp32_params.shape != nele:
                 self.prefetch_optimizer_gpu_fp32_params = torch.empty(nele, dtype=dtype, device=to_device, requires_grad = True)
-                self.prefetch_optimizer_gpu_fp32_params.grad = torch.empty(nele, dtype=dtype, device=to_device, requires_grad = False)
                 self.prefetch_optimizer_gpu_fp32_momentum = torch.empty(nele, dtype=dtype, device=to_device, requires_grad = False)
                 self.prefetch_optimizer_gpu_fp32_variance = torch.empty(nele, dtype=dtype, device=to_device, requires_grad = False)
-                    
+            if self.prefetch_optimizer_gpu_fp32_params.grad == None or self.prefetch_optimizer_gpu_fp32_params.grad.shape != nele:
+                self.prefetch_optimizer_gpu_fp32_params.grad = torch.empty(nele, dtype=dtype, device=to_device, requires_grad = False)
 
             copy_list.append((self.prefetch_optimizer_gpu_fp32_params.data, self.single_partition_of_fp32_groups[i].data[start_offset:end_offset]))
             copy_list.append((self.prefetch_optimizer_gpu_fp32_params.grad, self.single_partition_of_fp32_groups[i].grad[start_offset:end_offset]))
@@ -2018,7 +2019,6 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
             sizes = [min(x[0].numel(), x[1].numel())*x[0].element_size() for x in copy_list]
             copy_list = []
             self.prefetch_optimizer_copier.copy(src_tensors, dest_tensors, sizes)        
-                
         return True
 
     def step(self, closure=None):
@@ -2074,6 +2074,7 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
                     chunk_size = self.sub_group_size  if num_elements > self.sub_group_size else num_elements
                     start_offset = part_id * self.sub_group_size
                     end_offset = start_offset + chunk_size
+                    t = time.time()
 
                     if self.get_opt_update_device(part_id) == PF_OPT_CPU_PREF:
                         self.opt_transfers(i, part_id)
@@ -2094,8 +2095,6 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
                         
                         self.unscale_and_clip_grads([self.prefetch_optimizer_gpu_fp32_params], scaled_global_grad_norm)
                         self.backup_optimizer.step()
-                        if dist.get_rank() == 0:
-                            logger.info(f"Ran {part_id} on GPU")
 
                     # Run this for the CPU optimizer.
                     if self.get_opt_update_device(part_id) != PF_OPT_GPU_ONLY:
@@ -2129,7 +2128,7 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
                     num_elements -= self.sub_group_size
                     
                     if dist.get_rank() == 0:
-                        logger.info(f"Optimizer step completed for {i} for number of elements: {processed_elements} / {self.single_partition_of_fp32_groups[i].numel()}")
+                        logger.info(f"Optimizer step completed for {i} for number of elements: {processed_elements} / {self.single_partition_of_fp32_groups[i].numel()} in {time.time()-t}")
 
                 self.timers(OPTIMIZER_GRADIENTS_TIMER).stop()
                 self.timers(OPTIMIZER_STEP_TIMER).start()
