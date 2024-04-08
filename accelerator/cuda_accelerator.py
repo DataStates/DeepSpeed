@@ -178,6 +178,13 @@ class CUDA_Accelerator(DeepSpeedAccelerator):
         else:
             return torch_gpu_id
 
+    def get_pcie_name(self):
+        device_index = self.current_device()
+        handle = pynvml.nvmlDeviceGetHandleByIndex(self._get_nvml_gpu_id(device_index))
+        info = pynvml.nvmlDeviceGetPciInfo(handle)
+        bus_id = info.busId
+        return bus_id
+
     def available_memory(self, device_index=None):
         if pynvml:
             if device_index is None:

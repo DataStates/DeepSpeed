@@ -35,6 +35,7 @@ from deepspeed.utils import groups
 import sys
 from deepspeed.ops.op_builder import AsyncCopierBuilder
 import math, time
+import psutil
 # Toggle this to true to enable correctness test
 # with gradient partitioning and without
 pg_correctness_test = False
@@ -325,6 +326,9 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
                                                       maximize=False, foreach=None, capturable=False,
                                                       differentiable=False, fused=None
                                                       )
+            
+            logger.info(f"[Rank {dist.get_rank()}] running on {get_accelerator().current_device_name()} _get_nvml {get_accelerator().get_pcie_name()}")
+
             # Multiple param_groups configs for back-up optimizer
             # if len(self.optimizer.param_groups) > 1:
             #     for i in range(1, len(self.optimizer.param_groups)):
@@ -2021,6 +2025,62 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
             self.prefetch_optimizer_copier.copy(src_tensors, dest_tensors, sizes)        
         return True
 
+    @instrument_w_nvtx
+    def prefetch_optimizer_gpu_step(self, i, scaled_global_grad_norm, start_offset, end_offset):
+        self.prefetch_optimizer_copier.wait()
+        self.backup_optimizer.param_groups[i]['params'] = []
+        while len(self.backup_optimizer.state.keys()) > 0:
+            k = list(self.backup_optimizer.state.keys())[0]
+            del self.backup_optimizer.state[k]
+        self.backup_optimizer.param_groups[i]['params'] = [self.prefetch_optimizer_gpu_fp32_params]
+        assert self.prefetch_optimizer_gpu_fp32_params.numel() == end_offset-start_offset, f"Not prefetched on GPU right: {self.prefetch_optimizer_gpu_fp32_params.numel()}, need {end_offset-start_offset}"
+
+        self.backup_optimizer.state[self.prefetch_optimizer_gpu_fp32_params] = defaultdict(dict)
+        self.backup_optimizer.state[self.prefetch_optimizer_gpu_fp32_params]["step"] = self.prefetch_optimizer_fp32_steps[i]
+        self.backup_optimizer.state[self.prefetch_optimizer_gpu_fp32_params]["exp_avg"] = self.prefetch_optimizer_gpu_fp32_momentum
+        self.backup_optimizer.state[self.prefetch_optimizer_gpu_fp32_params]["exp_avg_sq"] = self.prefetch_optimizer_gpu_fp32_variance
+        
+        self.unscale_and_clip_grads([self.prefetch_optimizer_gpu_fp32_params], scaled_global_grad_norm)
+        self.backup_optimizer.step()
+
+    @instrument_w_nvtx
+    def prefetch_optimizer_cpu_step(self, i, scaled_global_grad_norm, start_offset, end_offset):
+        t = time.time()
+        partition_id = dist.get_rank(group=self.real_dp_process_group[i])
+        single_grad_partition = self.single_partition_of_fp32_groups[i].grad[start_offset:end_offset]
+        single_param_partition = self.single_partition_of_fp32_groups[i][start_offset:end_offset]
+        single_param_partition.grad = single_grad_partition
+        self.unscale_and_clip_grads([single_grad_partition], scaled_global_grad_norm)
+        original_param_groups = self.optimizer.param_groups
+        self.optimizer.param_groups = [original_param_groups[i]]
+        self.optimizer.param_groups[0]['params'] = [single_param_partition]
+
+        self.optimizer.state[single_param_partition] = defaultdict(dict)
+        self.optimizer.state[single_param_partition]["step"] = self.prefetch_optimizer_fp32_steps[i]
+        self.optimizer.state[single_param_partition]["exp_avg"] = self.prefetch_optimizer_cpu_fp32_momentums[i][start_offset:end_offset]
+        self.optimizer.state[single_param_partition]["exp_avg_sq"] = self.prefetch_optimizer_cpu_fp32_variances[i][start_offset:end_offset]
+        if dist.get_rank() == 0:
+            logger.info(f"Prefetch optimizer CPU: initial part took: {i} {time.time()-t}")
+        t = time.time()
+        self.optimizer.step()
+        if dist.get_rank() == 0:
+            logger.info(f"Prefetch optimizer CPU: step part took: {i} {time.time()-t}")
+        t = time.time()
+        while len(self.optimizer.state.keys()) > 0:
+            k = list(self.optimizer.state.keys())[0]
+            del self.optimizer.state[k]
+        self.optimizer.param_groups = original_param_groups
+        if dist.get_rank() == 0:
+            logger.info(f"Prefetch optimizer CPU: delete optimizer state part took: {i} {time.time()-t}")
+        t = time.time()
+        with get_accelerator().stream(self.prefetch_optimizer_stream):
+            self.parallel_partitioned_bit16_groups[i][partition_id].data[start_offset:end_offset].copy_(
+                self.single_partition_of_fp32_groups[i].data[start_offset:end_offset], non_blocking=True)
+        
+        if dist.get_rank() == 0:
+            logger.info(f"Prefetch optimizer CPU: last part took: {i} {time.time()-t}")
+    
+    @instrument_w_nvtx
     def step(self, closure=None):
         """
         Not supporting closure.
@@ -2080,50 +2140,12 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
                         self.opt_transfers(i, part_id)
                     # Run this on the GPU
                     elif self.get_opt_update_device(part_id) == PF_OPT_GPU_ONLY:
-                        self.prefetch_optimizer_copier.wait()
-                        self.backup_optimizer.param_groups[i]['params'] = []
-                        while len(self.backup_optimizer.state.keys()) > 0:
-                            k = list(self.backup_optimizer.state.keys())[0]
-                            del self.backup_optimizer.state[k]
-                        self.backup_optimizer.param_groups[i]['params'] = [self.prefetch_optimizer_gpu_fp32_params]
-                        assert self.prefetch_optimizer_gpu_fp32_params.numel() == end_offset-start_offset, f"Not prefetched on GPU right: {self.prefetch_optimizer_gpu_fp32_params.numel()}, need {end_offset-start_offset}"
-
-                        self.backup_optimizer.state[self.prefetch_optimizer_gpu_fp32_params] = defaultdict(dict)
-                        self.backup_optimizer.state[self.prefetch_optimizer_gpu_fp32_params]["step"] = self.prefetch_optimizer_fp32_steps[i]
-                        self.backup_optimizer.state[self.prefetch_optimizer_gpu_fp32_params]["exp_avg"] = self.prefetch_optimizer_gpu_fp32_momentum
-                        self.backup_optimizer.state[self.prefetch_optimizer_gpu_fp32_params]["exp_avg_sq"] = self.prefetch_optimizer_gpu_fp32_variance
-                        
-                        self.unscale_and_clip_grads([self.prefetch_optimizer_gpu_fp32_params], scaled_global_grad_norm)
-                        self.backup_optimizer.step()
-
+                        self.prefetch_optimizer_gpu_step(i, scaled_global_grad_norm, start_offset, end_offset)
                     # Run this for the CPU optimizer.
                     if self.get_opt_update_device(part_id) != PF_OPT_GPU_ONLY:
-                        single_grad_partition = self.single_partition_of_fp32_groups[i].grad[start_offset:end_offset]
-                        single_param_partition = self.single_partition_of_fp32_groups[i][start_offset:end_offset]
-                        single_param_partition.grad = single_grad_partition
-                        self.unscale_and_clip_grads([single_grad_partition], scaled_global_grad_norm)
-                        original_param_groups = self.optimizer.param_groups
-                        self.optimizer.param_groups = [original_param_groups[i]]
-                        self.optimizer.param_groups[0]['params'] = [single_param_partition]
-
-                        self.optimizer.state[single_param_partition] = defaultdict(dict)
-                        self.optimizer.state[single_param_partition]["step"] = self.prefetch_optimizer_fp32_steps[i]
-                        self.optimizer.state[single_param_partition]["exp_avg"] = self.prefetch_optimizer_cpu_fp32_momentums[i][start_offset:end_offset]
-                        self.optimizer.state[single_param_partition]["exp_avg_sq"] = self.prefetch_optimizer_cpu_fp32_variances[i][start_offset:end_offset]
-                        
-                        self.optimizer.step()
-                        while len(self.optimizer.state.keys()) > 0:
-                            k = list(self.optimizer.state.keys())[0]
-                            del self.optimizer.state[k]
-
-
-                        self.optimizer.param_groups = original_param_groups
-
-                        with get_accelerator().stream(self.prefetch_optimizer_stream):
-                            self.parallel_partitioned_bit16_groups[i][partition_id].data[start_offset:end_offset].copy_(
-                                self.single_partition_of_fp32_groups[i].data[start_offset:end_offset].half(), non_blocking=True)
+                        self.prefetch_optimizer_cpu_step(i, scaled_global_grad_norm, start_offset, end_offset)
                             
-                    processed_elements += single_param_partition.numel()
+                    processed_elements += chunk_size
                     part_id += 1
                     num_elements -= self.sub_group_size
                     
@@ -2181,17 +2203,18 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
                 bit16_partitions[partition_id].data.copy_(fp32_partition.data)
                 self.timers(OPTIMIZER_STEP_TIMER).stop()
 
-        self.prefetch_optimizer_stream.synchronize()
+        if self.prefetch_optimizer:
+            self.prefetch_optimizer_stream.synchronize()
 
-        # Cleanup the GPU-used data-structures
-        del self.backup_optimizer.param_groups[0]['params'][0]
-        while len(self.backup_optimizer.state.keys()) > 0:
-            k = list(self.backup_optimizer.state.keys())[0]
-            del self.backup_optimizer.state[k]
-        self.prefetch_optimizer_gpu_fp32_params.grad = None
-        self.prefetch_optimizer_gpu_fp32_params = None
-        self.prefetch_optimizer_gpu_fp32_momentum = None
-        self.prefetch_optimizer_gpu_fp32_variance = None
+            # Cleanup the GPU-used data-structures
+            del self.backup_optimizer.param_groups[0]['params'][0]
+            while len(self.backup_optimizer.state.keys()) > 0:
+                k = list(self.backup_optimizer.state.keys())[0]
+                del self.backup_optimizer.state[k]
+            self.prefetch_optimizer_gpu_fp32_params.grad = None
+            self.prefetch_optimizer_gpu_fp32_params = None
+            self.prefetch_optimizer_gpu_fp32_momentum = None
+            self.prefetch_optimizer_gpu_fp32_variance = None
 
         see_memory_usage('After optimizer before all-gather')
         # get_accelerator().empty_cache()
