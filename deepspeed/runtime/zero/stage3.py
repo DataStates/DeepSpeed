@@ -901,10 +901,19 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
                 else:
                     if self.prefetch_optimizer:
                         self.fp32_partitioned_groups_flat.append(self.fp16_partitioned_groups_flat[i].to(
-                            self.subgroup_to_device[i]).clone().float().detach().pin_memory())
-                        self.prefetch_optimizer_fp32_steps[i] = torch.zeros(1, device=self.device, dtype=torch.float32).pin_memory()
-                        self.prefetch_optimizer_fp32_momentums[i] = torch.empty(num_elements, device=self.device, dtype=torch.float32).pin_memory()
-                        self.prefetch_optimizer_fp32_variances[i] = torch.empty(num_elements, device=self.device, dtype=torch.float32).pin_memory()
+                            self.subgroup_to_device[i]).clone().float().detach())
+                        self.prefetch_optimizer_fp32_steps[i] = torch.zeros(1, device=self.subgroup_to_device[i], dtype=torch.float32)
+                        self.prefetch_optimizer_fp32_momentums[i] = torch.empty(num_elements, device=self.subgroup_to_device[i], dtype=torch.float32)
+                        self.prefetch_optimizer_fp32_variances[i] = torch.empty(num_elements, device=self.subgroup_to_device[i], dtype=torch.float32)
+                        if self.subgroup_to_device[i] == "cpu":
+                            self.fp32_partitioned_groups_flat[i] = self.fp32_partitioned_groups_flat[i].pin_memory()
+                            self.prefetch_optimizer_fp32_steps[i] = self.prefetch_optimizer_fp32_steps[i].pin_memory()
+                            self.prefetch_optimizer_fp32_momentums[i] = self.prefetch_optimizer_fp32_momentums[i].pin_memory()
+                            self.prefetch_optimizer_fp32_variances[i] = self.prefetch_optimizer_fp32_variances[i].pin_memory()
+
+
+
+
                     elif self.offload_optimizer:
                         self.fp32_partitioned_groups_flat.append(self.fp16_partitioned_groups_flat[i].to(
                             self.subgroup_to_device[i]).clone().float().detach())
