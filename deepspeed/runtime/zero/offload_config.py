@@ -56,7 +56,8 @@ class DeepSpeedZeroOffloadOptimizerConfig(DeepSpeedConfigModel):
     `nvme`. Optimizer computation is offload to CPU regardless of device option.
     """
 
-    nvme_path: Path = None
+    # nvme_path: Path = None
+    nvme_path: str = ""
     """ Filesystem path for NVMe device for optimizer state offloading. """
 
     buffer_count: int = Field(4, ge=0)
@@ -95,3 +96,7 @@ class DeepSpeedZeroOffloadOptimizerConfig(DeepSpeedConfigModel):
 
     ratio: float = Field(1.0, ge=0.0, le=1.0)
     """ Percentage of offloaded optimizer states to CPU Adam. Only valid with ZeRO Stage 3."""
+
+
+    dist_cpu_caching: bool = False
+    """ Enable CPU caching of optimizer states when offloaded to NVMe (update in arbitrary order)."""

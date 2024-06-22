@@ -71,8 +71,8 @@ def parse_range(rng):
                              (rng, ))
         start = int(parts[0])
         end = int(parts[1])
-        if start > end:
-            raise ValueError("Bad range: '%s', range end must larger than or equal to start" % (rng, ))
+        # if start > end:
+        #     raise ValueError("Bad range: '%s', range end must larger than or equal to start" % (rng, ))
         return range(start, end + 1)
 
 
@@ -89,11 +89,11 @@ def parse_range_list(range_str):
     range_list = range_str.split(',')
     for sub_range in range_list:
         sub_number_list = parse_range(sub_range)
-        if sub_number_list[0] <= last:
-            raise ValueError(
-                "Bad range: '%s', sub ranges must not overlap with each other and should be in ascend order" %
-                (range_str, ))
-        last = sub_number_list[-1]
+        # if sub_number_list[0] <= last:
+        #     raise ValueError(
+        #         "Bad range: '%s', sub ranges must not overlap with each other and should be in ascend order" %
+        #         (range_str, ))
+        # last = sub_number_list[-1]
         number_list.extend(sub_number_list)
     return number_list
 

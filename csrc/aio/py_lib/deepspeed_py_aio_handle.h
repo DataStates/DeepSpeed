@@ -12,7 +12,10 @@ Functionality for swapping optimizer tensors to/from (NVMe) storage devices.
 #include "deepspeed_aio_thread.h"
 #include "deepspeed_pin_tensor.h"
 
+// static int id_gen = 0;
+
 struct deepspeed_aio_handle_t {
+    // int my_id;
     std::unique_ptr<struct aio_context> _aio_ctxt;
     const bool _single_submit;
     const bool _overlap_events;
@@ -74,4 +77,10 @@ struct deepspeed_aio_handle_t {
     std::shared_ptr<struct io_op_desc_t> _wait_for_aio_work();
 
     bool _is_valid_parallel_aio_op(const bool read_op, const long long int num_bytes);
+
+    // int get_num_pending() {
+    //     return _num_pending_ops;
+    // };
+
+    // void print_pending();
 };

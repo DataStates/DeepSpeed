@@ -43,4 +43,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
         .def("free_cpu_locked_tensor", &deepspeed_aio_handle_t::free_cpu_locked_tensor)
 
         .def("wait", &deepspeed_aio_handle_t::wait);
+
+        // .def("get_num_pending", &deepspeed_aio_handle_t::get_num_pending);
 }

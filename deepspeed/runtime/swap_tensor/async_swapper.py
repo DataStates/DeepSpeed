@@ -126,13 +126,14 @@ class AsyncTensorSwapper(object):
         assert len(self.free_buffer_index) == len(self.all_buffers)
 
     def _swap_out_ready_buffers(self):
+        # prev_num_pending = self.num_pending_swaps
         for buffer_index in self.ready_buffer_index:
             buffer = self._get_buffer(buffer_index)
             swap_tensors = buffer.get_swap_tensors()
             swap_paths = buffer.get_swap_paths()
             self.num_pending_swaps += len(swap_tensors)
             swap_out_tensors(self.aio_handle, swap_tensors, swap_paths)
-
+        # print(f"-----> At {swap_paths[0]} prev_num_pending: {prev_num_pending}, wait: {self.aio_handle.get_num_pending()}, curr_num_pending: {self.num_pending_swaps} using {self.aio_handle.__hash__()}")
         self.swapping_buffer_index += self.ready_buffer_index
         self.ready_buffer_index = []
 
@@ -140,7 +141,9 @@ class AsyncTensorSwapper(object):
         assert len(self.swapping_buffer_index) > 0
 
         self._start_timer(ASYNC_SWAPPER_WAIT_TIMER)
-        assert self.aio_handle.wait() == self.num_pending_swaps
+        # print(f">>>>> In wait for swap complete..... {self.aio_handle.__hash__()}")
+        wait_val = self.aio_handle.wait()
+        assert wait_val == self.num_pending_swaps, f"In wait for swap complete: aio_handle_wait {wait_val}, num_pending_aio: {self.aio_handle.get_num_pending()} and num_pending: {self.num_pending_swaps} for path {self._get_buffer(0).get_swap_paths()[0]} at handle {self.aio_handle.__hash__()}"
         self._stop_timer(ASYNC_SWAPPER_WAIT_TIMER)
         self.timer_names.add(ASYNC_SWAPPER_WAIT_TIMER)
 

@@ -153,7 +153,7 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
         self.custom_loss_scaler = False
         self.external_loss_scale = None
 
-        self.optimizer_swapper = None
+        self.optimizer_swapper = []
         self.swap_optimizer = False
 
         self.offload_optimizer = False
@@ -164,6 +164,8 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
         self.params_in_nvme_and_cpu = False
         self.max_params_in_cpu = 0
         self.partial_offload = offload_ratio
+
+        self.dist_cpu_caching = False
 
         #num of ranks in a ZeRO param partitioning group
         self.zero_hpz_partition_size = zero_hpz_partition_size
@@ -292,7 +294,6 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
         #a single 32-bit partition of the parallel partitioned parameters
         #that this process will update
         self.fp32_partitioned_groups_flat = []
-        self.next_swappable_fp32_partitioned_groups = []
 
         # number of elements per partition in each group
         self.partition_size = []
@@ -321,6 +322,7 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
         # Optimizer tensor swapping
         if self.swap_optimizer:
             self._configure_tensor_swapping(offload_optimizer_config, aio_config)
+        self.next_swappable_fp32_partitioned_groups = [[] for _ in range(len(self.optimizer_swapper))]
 
         self.is_gradient_accumulation_boundary: bool = True
 
@@ -569,6 +571,7 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
             self.offload_optimizer_pin_memory = offload_optimizer_config.pin_memory
             self.swap_optimizer = offload_optimizer_config.device == OffloadDeviceEnum.nvme
             self.offload_optimizer_fast_init = offload_optimizer_config.fast_init
+            self.dist_cpu_caching = offload_optimizer_config.dist_cpu_caching
 
         ###################### offload param setup ##################################
         if offload_param_config is not None and offload_param_config.device != OffloadDeviceEnum.none:
@@ -580,22 +583,25 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
                 f"FP16 params swapping is {self.params_in_nvme_and_cpu}, Max params in CPU is {self.max_params_in_cpu}",
                 force=False)
 
-    def _configure_tensor_swapping(self, offload_optimizer_config, aio_config):
-        nvme_swap_folder = os.path.join(offload_optimizer_config.nvme_path, 'zero_stage_3')
-        os.makedirs(nvme_swap_folder, exist_ok=True)
-        if dist.get_rank() == 0:
-            logger.info(f'Tensor Swapping: Adding optimizer tensors')
+    def _configure_tensor_swapping(self, offload_optimizer_config, aio_config):        
+        nvme_paths = offload_optimizer_config.nvme_path.split(";")        
+        for nvme_path in nvme_paths:
+            nvme_swap_folder = os.path.join(nvme_path, 'zero_stage_3')
+            os.makedirs(nvme_swap_folder, exist_ok=True)
+            if dist.get_rank() == 0:
+                logger.info(f'Tensor Swapping: Adding optimizer tensors at {nvme_swap_folder}')
 
-        swapper_type = PipelinedOptimizerSwapper if offload_optimizer_config.pipeline else PartitionedOptimizerSwapper
+            swapper_type = PipelinedOptimizerSwapper if offload_optimizer_config.pipeline else PartitionedOptimizerSwapper
 
-        self.optimizer_swapper = swapper_type(swap_config=offload_optimizer_config,
-                                              aio_config=aio_config,
-                                              base_folder=nvme_swap_folder,
-                                              optimizer=self.optimizer,
-                                              largest_numel=max(self.fp16_partitioned_groups_flat_numel),
-                                              device=self.device,
-                                              dtype=torch.float32,
-                                              timers=self.timers)
+            swapper = swapper_type(swap_config=offload_optimizer_config,
+                                                aio_config=aio_config,
+                                                base_folder=nvme_swap_folder,
+                                                optimizer=self.optimizer,
+                                                largest_numel=max(self.fp16_partitioned_groups_flat_numel),
+                                                device=self.device,
+                                                dtype=torch.float32,
+                                                timers=self.timers)
+            self.optimizer_swapper.append(swapper)
 
     @property
     def elements_in_ipg_bucket(self):
@@ -772,12 +778,28 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
         reverse_order_indices.reverse()
 
         next_group = None
+        next_group_id = 0
+        # temp_id = None
         for i in reverse_order_indices:
-            self.next_swappable_fp32_partitioned_groups.append(next_group)
+            self.next_swappable_fp32_partitioned_groups[next_group_id].append(next_group)
+            # print(f"Will add in {next_group_id} temp_id  {temp_id}")
+            next_group_id = self._get_opt_swapper_id(i)
             if self._swappable_optimizer_subgroup(i):
                 next_group = self.fp32_partitioned_groups_flat[i]
+                # temp_id = self.fp32_partitioned_groups_flat[i].ds_id
 
-        self.next_swappable_fp32_partitioned_groups.reverse()
+        for i in range(len(self.next_swappable_fp32_partitioned_groups)):
+            self.next_swappable_fp32_partitioned_groups[i].reverse()
+        
+    def _get_next_swappable_fp32_partitioned_groups(self, subgroup_id):
+        swapper_id = self._get_opt_swapper_id(subgroup_id)
+        idx = (subgroup_id + 1)//len(self.optimizer_swapper)
+        next_group = None
+        if idx < len(self.next_swappable_fp32_partitioned_groups[swapper_id]):
+            next_group = self.next_swappable_fp32_partitioned_groups[swapper_id][idx]        
+        # print(f"Going to get next for subgroup_id {subgroup_id} working on swapper id {swapper_id}, group as {next_group.ds_id} ")
+        return next_group
+        
 
     def _get_sub_group_partitions(self, sub_group_id):
         sub_group_partitions = []
@@ -791,6 +813,14 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
 
         return sub_group_partitions
 
+    def _get_opt_swapper_id(self, subgroup_id):
+        n = len(self.optimizer_swapper)
+        return subgroup_id%n
+    
+    def _get_opt_swapper(self, subgroup_id):
+        n = self._get_opt_swapper_id(subgroup_id)
+        return self.optimizer_swapper[n]
+
     def _create_fp32_partitions(self):
         cpu_memory_usage = 0
         cpu_memory_sub_groups = 0
@@ -802,8 +832,8 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
         swap_from_cpu_memory_usage = 0
         GIGA_BYTES = (1024**3)
 
-        swappable_fp32_tensors = []
-        swappable_fp16_src_tensors = []
+        swappable_fp32_tensors = [[] for _ in range(len(self.optimizer_swapper))]
+        swappable_fp16_src_tensors = [[] for _ in range(len(self.optimizer_swapper))]
         nvme_fp16_partitions_info = []
         nvme_fp16_num_elems = []
         nvme_fp32_dest_tensors = []
@@ -833,6 +863,7 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
                     num_swap_from_nvme_partitions += 1
                     swap_from_nvme_memory_usage += (fp32_element_size * num_elements)
                     if self.offload_optimizer_fast_init:
+                        assert False, "Fast init currently not supported"
                         sub_group_partitions = self._get_sub_group_partitions(i)
                         nvme_fp16_partitions_info.append(sub_group_partitions)
                         nvme_fp16_num_elems.append(num_elements)
@@ -840,13 +871,13 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
                     else:
                         unpinned_fp32_buffer = torch.empty(num_elements, device=self.device, dtype=torch.float)
                         self._swap_in_sub_group_to_flat_buffer(unpinned_fp32_buffer, i)
-                        self.optimizer_swapper.initialize_parameters(parameters=[self.fp32_partitioned_groups_flat[i]],
+                        self._get_opt_swapper(i).initialize_parameters(parameters=[self.fp32_partitioned_groups_flat[i]],
                                                                      src_tensors=[unpinned_fp32_buffer])
                 else:
                     num_swap_from_cpu_partitions += 1
                     swap_from_cpu_memory_usage += (fp32_element_size * num_elements)
-                    swappable_fp32_tensors.append(self.fp32_partitioned_groups_flat[i])
-                    swappable_fp16_src_tensors.append(self.fp16_partitioned_groups_flat[i])
+                    swappable_fp32_tensors[self._get_opt_swapper_id(i)].append(self.fp32_partitioned_groups_flat[i])
+                    swappable_fp16_src_tensors[self._get_opt_swapper_id(i)].append(self.fp16_partitioned_groups_flat[i])
             else:
                 cpu_memory_usage += (fp32_element_size * num_elements)
                 cpu_memory_sub_groups += 1
@@ -866,11 +897,15 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
             self.fp32_partitioned_groups_flat[i].requires_grad = True  # keep this in case internal optimizer uses it
             self.fp32_partitioned_groups_flat[i].ds_id = '_'.join(map(str, self.fp16_partitioned_groups_flat_id[i]))
 
-        if len(swappable_fp32_tensors) > 0:
-            self.optimizer_swapper.initialize_parameters(parameters=swappable_fp32_tensors,
-                                                         src_tensors=swappable_fp16_src_tensors)
+        if sum(len(x) for x in swappable_fp32_tensors) > 0:
+            for i in range(len(self.optimizer_swapper)):
+                swappable_fp32_tensor = swappable_fp32_tensors[i]
+                swappable_fp16_src_tensor = swappable_fp16_src_tensors[i]
+                self._get_opt_swapper(i).initialize_parameters(parameters=swappable_fp32_tensor,
+                                                         src_tensors=swappable_fp16_src_tensor)
 
         if len(nvme_fp32_dest_tensors) > 0:
+            assert False, "Fast init currently not supported"
             fp16_pinned_buffers = self.fp16_groups[0][0].nvme_swapper.reserve_available_buffers()
             assert len(fp16_pinned_buffers) > 0
             self.optimizer_swapper.initialize_from_swapped_fp16_params(fp16_partitions_info=nvme_fp16_partitions_info,
@@ -949,7 +984,7 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
         if not self.swap_optimizer:
             return False
 
-        return self.optimizer_swapper.swappable_tensor(None,
+        return self._get_opt_swapper(sub_group_id).swappable_tensor(None,
                                                        numel=self.fp16_partitioned_groups_flat_numel[sub_group_id])
 
     def _partitioned_params_swap_out(self, i):
@@ -987,7 +1022,8 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
         is_adagrad = isinstance(self.optimizer, torch.optim.Adagrad)
 
         if self.swap_optimizer:
-            self.optimizer_swapper.init_timers()
+            for x in self.optimizer_swapper:
+                x.init_timers()
 
         timer_names.add(INIT_OPTIMIZER_TIMER)
         self.timers(INIT_OPTIMIZER_TIMER).start()
@@ -1032,7 +1068,8 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
         self.timers.log(timer_names)
 
         if self.swap_optimizer:
-            self.optimizer_swapper.log_timers()
+            for x in self.optimizer_swapper:
+                x.log_timers()
 
         if not self.offload_optimizer:
             for group in self.fp32_partitioned_groups_flat:
@@ -1462,7 +1499,7 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
                     else:
                         fp32_grad_tensor = self.fp32_partitioned_groups_flat[i].grad.narrow(
                             0, dest_offset, grad_buffer.numel())
-                        fp32_grad_tensor.copy_(grad_buffer)
+                        fp32_grad_tensor.copy_(grad_buffer, non_blocking=True)
 
             # free the gradient
             if not get_accelerator().is_synchronized_device():
@@ -1471,7 +1508,7 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
 
         if self.offload_optimizer and self.swap_optimizer:
             for i in offload_fp32_gradients.keys():
-                self.optimizer_swapper.swap_out_gradients(parameter=self.fp32_partitioned_groups_flat[i],
+                self._get_opt_swapper(i).swap_out_gradients(parameter=self.fp32_partitioned_groups_flat[i],
                                                           gradient_offsets=offload_fp32_offsets[i],
                                                           gradient_tensors=offload_fp32_gradients[i])
         return buffers
@@ -1882,9 +1919,11 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
         timer_names.add(OPTIMIZER_SWAP_IN_STATE_TIMER)
         self.timers(OPTIMIZER_SWAP_IN_STATE_TIMER).start()
 
-        self.optimizer_swapper.swap_in_optimizer_state(
+        # logger.info(f"Going to swap in through opt {self._get_opt_swapper_id(sub_group_id)} subgroup {sub_group_id}, which is {self.fp32_partitioned_groups_flat[sub_group_id]} with id {self.fp32_partitioned_groups_flat[sub_group_id].ds_id}")
+
+        self._get_opt_swapper(sub_group_id).swap_in_optimizer_state(
             parameter=self.fp32_partitioned_groups_flat[sub_group_id],
-            async_parameter=self.next_swappable_fp32_partitioned_groups[sub_group_id])
+            async_parameter=self._get_next_swappable_fp32_partitioned_groups(sub_group_id))
 
         self.timers(OPTIMIZER_SWAP_IN_STATE_TIMER).stop()
         see_memory_usage(f'pre-step After swapping in optimizer tensors {sub_group_id}', force=False)
@@ -1930,9 +1969,9 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
         timer_names.add(OPTIMIZER_SWAP_OUT_STATE_TIMER)
         self.timers(OPTIMIZER_SWAP_OUT_STATE_TIMER).start()
 
-        self.optimizer_swapper.swap_out_optimizer_state(
+        self._get_opt_swapper(sub_group_id).swap_out_optimizer_state(
             parameter=self.fp32_partitioned_groups_flat[sub_group_id],
-            async_swap=self.next_swappable_fp32_partitioned_groups[sub_group_id] is not None)
+            async_swap=self._get_next_swappable_fp32_partitioned_groups(sub_group_id) is not None)
 
         self.timers(OPTIMIZER_SWAP_OUT_STATE_TIMER).stop()
         see_memory_usage(f'post-step After swapping out optimizer tensors {sub_group_id}', force=False)
@@ -1984,7 +2023,8 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
             self.persistent_parameters[0].all_gather(self.persistent_parameters)
 
         if self.swap_optimizer:
-            self.optimizer_swapper.log_timers()
+            for x in self.optimizer_swapper:
+                x.log_timers()
 
         self.invalidate_secondary_tensor()
 
@@ -2021,7 +2061,8 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
         #checks for overflow, adjust the loss scale accordingly
         if self._overflow_check_and_loss_scale_update():
             if self.swap_optimizer:
-                self.optimizer_swapper.log_timers()
+                for x in self.optimizer_swapper:
+                    x.log_timers()
             return
 
         norm_groups = self._get_norm_groups()
@@ -2200,7 +2241,8 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
         3. scaled_loss.backward(), which accumulates scaled gradients into the ``.grad`` attributes of the model's fp16 leaves
         """
         if self.swap_optimizer:
-            self.optimizer_swapper.pre_backward()
+            for x in self.optimizer_swapper:
+                x.pre_backward()
 
         see_memory_usage(f"Before backward", force=False)
 
@@ -2213,7 +2255,8 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
         self._get_param_coordinator(training=True).reset_step()
 
         if self.swap_optimizer:
-            self.optimizer_swapper.post_backward()
+            for x in self.optimizer_swapper:
+                x.post_backward()
 
     def get_fp32_grad_partitions(self) -> Dict[int, Dict[int, Tensor]]:
         """get fp32 gradient partition dictionary
@@ -2552,7 +2595,7 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
 
         if self.swap_optimizer or self.params_in_nvme_and_cpu:
             # Purge the swapped optimizer state, it was initialized to the freshly created model and not the checkpoint
-            for swap_info in self.optimizer_swapper.swap_params_info.values():
+            for swap_info in self.optimizer_swapper[0].swap_params_info.values():
                 swap_info.tensors = [swap_info.tensors[0]]
                 swap_info.has_state_tensors = False
 

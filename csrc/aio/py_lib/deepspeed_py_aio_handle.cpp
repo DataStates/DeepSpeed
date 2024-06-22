@@ -29,6 +29,8 @@ deepspeed_aio_handle_t::deepspeed_aio_handle_t(const int block_size,
       _num_pending_ops(0),
       _pinned_tensor_mgr(new deepspeed_pin_tensor_t())
 {
+    // my_id = id_gen++;
+    // std::cout << ">>>>>>>>> Starting a new deepspeed_aio_handle_t with ID: " << my_id << std::endl;
     for (auto i = 0; i < num_threads; ++i) {
         _thread_contexts.push_back(std::make_shared<deepspeed_aio_thread_t>(i, _aio_config));
     }
@@ -136,14 +138,21 @@ int deepspeed_aio_handle_t::write(const torch::Tensor& buffer,
 
 void deepspeed_aio_handle_t::_schedule_aio_work(std::shared_ptr<struct io_op_desc_t> scheduled_op)
 {
+    // int total_pending = 0;
     for (auto& ctxt : _thread_contexts) {
         {
             std::lock_guard<std::mutex> lock(ctxt->_work_sync._mutex);
             ctxt->_work_queue.push(scheduled_op);
         }
         ctxt->_work_sync._cond_var.notify_one();
+        // total_pending += ctxt->_work_queue.size();
     }
     _num_pending_ops++;
+    // std::cout << "Scheduling AIO work.... " << " read op " << scheduled_op->_read_op << " filename " << scheduled_op->_filename << my_id << std::endl;
+    // print_pending();
+    // if (_num_pending_ops != total_pending) {
+    //     std::cout << "------ Problem here::: ctx " << my_id << " num pending " << _num_pending_ops << " total pending in work_queue " << total_pending << std::endl;
+    // }
 }
 
 std::shared_ptr<struct io_op_desc_t> deepspeed_aio_handle_t::_wait_for_aio_work()
@@ -171,8 +180,25 @@ void deepspeed_aio_handle_t::_stop_threads()
     }
 }
 
+// void deepspeed_aio_handle_t::print_pending() {
+//     for (auto& ctxt : _thread_contexts) {
+//         if (!ctxt->_work_queue.empty()) {
+//             auto x = ctxt->_work_queue.front();
+//             std::cout << " Pending in work queue: read_op " << x->_read_op << " filename " << x->_filename << " num ops " << ctxt->_work_queue.size() << " ctx " << my_id << std::endl;
+//         } else 
+//             std::cout << " Pending in work queue: EMPTY ctx " << my_id << std::endl;
+//         if (!ctxt->_complete_queue.empty()) {
+//             auto x = ctxt->_complete_queue.front();
+//             std::cout << " Pending in complete queue: read_op " << x->_read_op << " filename " << x->_filename << " num ops " << ctxt->_complete_queue.size() << " ctx " << my_id << std::endl;
+//         } else 
+//             std::cout << " Pending in complete queue: EMPTY ctx " << my_id << std::endl;
+//     }
+// }
+
 int deepspeed_aio_handle_t::wait()
 {
+    // std::cout << "In wait(), got num pending ops as " <<_num_pending_ops << " ctx " << my_id << std::endl;
+    // print_pending();
     assert(_num_pending_ops > 0);
     auto num_completed_ops = 0;
 
@@ -259,7 +285,10 @@ int deepspeed_aio_handle_t::pwrite(const torch::Tensor& buffer,
     auto scheduled_op = std::make_shared<io_op_desc_t>(
         false, buffer, fd, filename, (num_write_bytes / _num_threads), validate);
 
+    // std::cout << filename << " Going to schedule_aio_work " << _num_pending_ops << " ctx " << my_id << std::endl;
+    // print_pending();
     _schedule_aio_work(scheduled_op);
+    // std::cout << filename << "After increment the num tasks " << _num_pending_ops << " ctx " << my_id << std::endl;
 
     if (async) { return 0; }
 
