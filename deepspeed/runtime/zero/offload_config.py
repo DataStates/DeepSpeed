@@ -98,5 +98,5 @@ class DeepSpeedZeroOffloadOptimizerConfig(DeepSpeedConfigModel):
     """ Percentage of offloaded optimizer states to CPU Adam. Only valid with ZeRO Stage 3."""
 
 
-    dist_cpu_caching: bool = False
+    dist_cpu_caching: float = 0.0
     """ Enable CPU caching of optimizer states when offloaded to NVMe (update in arbitrary order)."""

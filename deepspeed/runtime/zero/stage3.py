@@ -165,7 +165,7 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
         self.max_params_in_cpu = 0
         self.partial_offload = offload_ratio
 
-        self.dist_cpu_caching = False
+        self.dist_cpu_caching = 0.0
 
         #num of ranks in a ZeRO param partitioning group
         self.zero_hpz_partition_size = zero_hpz_partition_size
@@ -793,7 +793,8 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
         
     def _get_next_swappable_fp32_partitioned_groups(self, subgroup_id):
         swapper_id = self._get_opt_swapper_id(subgroup_id)
-        idx = (subgroup_id + 1)//len(self.optimizer_swapper)
+        num_swappers = len(self.optimizer_swapper)-1
+        idx = (subgroup_id + num_swappers)//len(self.optimizer_swapper)
         next_group = None
         if idx < len(self.next_swappable_fp32_partitioned_groups[swapper_id]):
             next_group = self.next_swappable_fp32_partitioned_groups[swapper_id][idx]        
@@ -983,6 +984,9 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
     def _swappable_optimizer_subgroup(self, sub_group_id):
         if not self.swap_optimizer:
             return False
+        elif sub_group_id/len(self.fp16_partitioned_groups_flat) < self.dist_cpu_caching:
+            return False
+
 
         return self._get_opt_swapper(sub_group_id).swappable_tensor(None,
                                                        numel=self.fp16_partitioned_groups_flat_numel[sub_group_id])
