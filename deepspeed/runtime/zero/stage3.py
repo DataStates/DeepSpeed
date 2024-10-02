@@ -4,6 +4,7 @@
 # DeepSpeed Team
 
 import sys
+import time
 import gc
 import collections
 from typing import Deque, Dict, Tuple
@@ -29,6 +30,9 @@ from deepspeed.runtime.swap_tensor.pipelined_optimizer_swapper import PipelinedO
 from deepspeed.checkpoint.constants import OPTIMIZER_STATE_DICT, FP32_FLAT_GROUPS, PARTITION_COUNT, ZERO_STAGE, LOSS_SCALER
 from deepspeed.accelerator import get_accelerator
 from deepspeed.utils import z3_leaf_parameter
+from collections import deque
+import fasteners
+import threading
 
 # Toggle this to true to enable correctness test
 # with gradient partitioning and without
@@ -166,6 +170,32 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
         self.partial_offload = offload_ratio
 
         self.dist_cpu_caching = 0.0
+
+        self.dist_opt_read_q = deque()
+        self.dist_opt_read_lock = fasteners.InterProcessLock('/dev/shm/dist_opt_read_lock.file')
+        self.dist_opt_read_lock.acquire()
+        self.dist_opt_read_lock.release()
+        self.dist_opt_read_cv = threading.Condition()
+        self.dist_opt_read_thread = threading.Thread(target=self.dist_opt_reader)
+        self.dist_opt_read_thread.start()
+        
+
+        self.dist_opt_update_q = deque()
+        self.dist_opt_update_lock = fasteners.InterProcessLock('/dev/shm/dist_opt_compute_lock.file')
+        self.dist_opt_update_lock.acquire()
+        self.dist_opt_update_lock.release()
+        self.dist_opt_update_cv = threading.Condition()
+        self.dist_opt_update_thread = threading.Thread(target=self.dist_opt_updater)
+        self.dist_opt_update_thread.start()
+
+        self.dist_opt_write_q = deque()
+        self.dist_opt_write_lock = fasteners.InterProcessLock('/dev/shm/dist_opt_write_lock.file')
+        self.dist_opt_write_lock.acquire()
+        self.dist_opt_write_lock.release()
+        self.dist_opt_write_cv = threading.Condition()
+        self.dist_opt_write_thread = threading.Thread(target=self.dist_opt_writer)
+        self.dist_opt_write_thread.start()
+
 
         #num of ranks in a ZeRO param partitioning group
         self.zero_hpz_partition_size = zero_hpz_partition_size
@@ -1510,11 +1540,14 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
                 param.grad.record_stream(get_accelerator().current_stream())
             param.grad = None
 
+
+        t = time.time()
         if self.offload_optimizer and self.swap_optimizer:
             for i in offload_fp32_gradients.keys():
                 self._get_opt_swapper(i).swap_out_gradients(parameter=self.fp32_partitioned_groups_flat[i],
                                                           gradient_offsets=offload_fp32_offsets[i],
                                                           gradient_tensors=offload_fp32_gradients[i])
+        print(f"\t\tTime to swap out gradients is {time.time()-t}")
         return buffers
 
     def reduce_ready_partitions_and_remove_grads(self, param):
@@ -1907,10 +1940,12 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
     @instrument_w_nvtx
     def _prepare_sub_group(self, sub_group_id, timer_names):
         see_memory_usage(f'Before prepare optimizer sub group {sub_group_id}', force=False)
+        t = time.time()
         if self._swappable_optimizer_subgroup(sub_group_id):
             self._optimizer_states_and_gradient_swap_in(sub_group_id, timer_names)
         elif not self.offload_optimizer:
             self._prepare_fp32_grad_for_sub_group(sub_group_id)
+        print(f"\t\tTime to prepare subgroup {sub_group_id} is {time.time()-t}")
         see_memory_usage(f'After prepare optimizer sub group {sub_group_id}', force=False)
 
     def _optimizer_states_and_gradient_swap_in(self, sub_group_id, timer_names):
@@ -1936,11 +1971,13 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
     def _release_sub_group(self, sub_group_id, timer_names):
         see_memory_usage(f'Before release optimizer sub group {sub_group_id}', force=False)
         # get rid of the fp32 gradients. Not needed anymore
+        t = time.time()
         if not self.offload_optimizer:
             self.fp32_partitioned_groups_flat[sub_group_id].grad = None
 
         if self._swappable_optimizer_subgroup(sub_group_id):
             self._optimizer_states_and_gradient_swap_out(sub_group_id, timer_names)
+        print(f"\t\tTime to release subgroup {sub_group_id} is {time.time()-t}")
         see_memory_usage(f'After release optimizer sub group {sub_group_id}', force=False)
 
     # create a flat tensor aligned at the alignment boundary
@@ -2054,6 +2091,99 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
         self.custom_loss_scaler = True
         self.external_loss_scale = loss_scale
 
+    def dist_opt_reader(self):
+        while True:
+            with self.dist_opt_read_cv:
+                while len(self.dist_opt_read_q) == 0:
+                    self.dist_opt_read_cv.wait()
+                # print(f"Dist_opt_reader has len of {len(self.dist_opt_read_q)}")
+                try:    
+                    self.dist_opt_read_lock.acquire()
+                    (sub_group_id, timer_names, scaled_global_grad_norm) = self.dist_opt_read_q[0]
+                    # print(f"Got read lock for subgroup {sub_group_id}")
+                    self._prepare_sub_group(sub_group_id, timer_names)
+                    with self.dist_opt_update_cv:
+                        self.dist_opt_update_q.append((sub_group_id, timer_names, scaled_global_grad_norm))
+                        self.dist_opt_update_cv.notify_all()
+                    self.dist_opt_read_q.popleft()
+                    self.dist_opt_read_cv.notify_all()
+                except Exception as e:
+                    print(f"Error: cannot read {sub_group_id}: {e}")
+                    sys.exit(-1)
+                finally:
+                    self.dist_opt_read_lock.release()            
+
+    def dist_opt_updater(self):
+        while True:
+            with self.dist_opt_update_cv:
+                while len(self.dist_opt_update_q) == 0:
+                    self.dist_opt_update_cv.wait()
+                # print(f"Dist_opt_updater has len of {len(self.dist_opt_update_q)}")
+                try:
+                    self.dist_opt_update_lock.acquire()
+                    (sub_group_id, timer_names, scaled_global_grad_norm) = self.dist_opt_update_q[0]
+                    # print(f"Got update lock for subgroup {sub_group_id}")
+                    t = time.time()
+                    self.unscale_and_clip_grads(sub_group_id, scaled_global_grad_norm)
+                    self._optimizer_step(sub_group_id)
+                    print(f"Time to run the optimizer step for subgroup {sub_group_id} is {time.time()-t}")
+                    with self.dist_opt_write_cv:
+                        self.dist_opt_write_q.append((sub_group_id, timer_names, scaled_global_grad_norm))
+                        self.dist_opt_write_cv.notify_all()
+                    self.dist_opt_update_q.popleft()
+                    self.dist_opt_update_cv.notify_all()
+                except Exception as e:
+                    print(f"Error: cannot update {sub_group_id}: {e}")
+                    sys.exit(-1)
+                finally:
+                    self.dist_opt_update_lock.release()
+                
+
+    def dist_opt_writer(self):
+        while True:
+            with self.dist_opt_write_cv:
+                while len(self.dist_opt_write_q) == 0:
+                    self.dist_opt_write_cv.wait()
+                # print(f"Dist_opt_write has len of {len(self.dist_opt_write_q)}")
+                try:
+                    self.dist_opt_write_lock.acquire()
+                    (sub_group_id, timer_names, scaled_global_grad_norm) = self.dist_opt_write_q[0]
+                    print(f"Got write lock for subgroup {sub_group_id}")
+                    self._reassign_or_swap_out_partitioned_parameters(sub_group_id)
+                    self._release_sub_group(sub_group_id, timer_names)
+                    self.dist_opt_write_q.popleft()
+                    self.dist_opt_write_cv.notify_all()
+                except Exception as e:
+                    print(f"Error: cannot write back {sub_group_id}: {e}")
+                    sys.exit(-1)
+                finally:
+                    self.dist_opt_write_lock.release()
+                
+
+
+    def dist_opt_step(self, timer_names, scaled_global_grad_norm):
+        print(f"In dist_opt_step...")
+        with self.dist_opt_read_cv:
+            for sub_group_id, _ in enumerate(self.fp16_groups):
+                self.dist_opt_read_q.append((sub_group_id, timer_names, scaled_global_grad_norm))
+            self.dist_opt_read_cv.notify_all()
+            print(f"Added {len(self.dist_opt_read_q)} in dist_opt_step")
+
+        with self.dist_opt_read_cv:
+                while len(self.dist_opt_read_q)>0:
+                    self.dist_opt_read_cv.wait()
+
+        with self.dist_opt_write_cv:
+                while len(self.dist_opt_write_q)>0:
+                    self.dist_opt_write_cv.wait()
+
+        with self.dist_opt_update_cv:
+                while len(self.dist_opt_update_q)>0:
+                    self.dist_opt_update_cv.wait()
+
+        
+        
+
     @instrument_w_nvtx
     def step(self, closure=None):
         """
@@ -2084,19 +2214,28 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
         for sub_group_id, group in enumerate(self.fp16_groups):
 
             #prepare optimizer states, gradients and fp32 parameters for update
+            self.dist_opt_read_lock.acquire()
             self._prepare_sub_group(sub_group_id, timer_names)
+            self.dist_opt_read_lock.release()
 
+            t = time.time()
+            self.dist_opt_update_lock.acquire()
             #scale the fp32 gradients
             self.unscale_and_clip_grads(sub_group_id, scaled_global_grad_norm)
 
             #apply the optimizer step on the sub group and copy fp32 parameters to fp16
             self._optimizer_step(sub_group_id)
+            self.dist_opt_update_lock.release()
+            print(f"\t\tTime to actually compute subgroup {sub_group_id} is {time.time()-t}")
 
             #put fp16 parameters in appropriate location
+            self.dist_opt_write_lock.acquire()
             self._reassign_or_swap_out_partitioned_parameters(sub_group_id)
 
             #release memory or swap out optimizer states of fp32 parameters
             self._release_sub_group(sub_group_id, timer_names)
+            self.dist_opt_write_lock.release()
+        # self.dist_opt_step(timer_names, scaled_global_grad_norm)
 
         self.timers(OPTIMIZER_STEP_TIMER).stop()
 
