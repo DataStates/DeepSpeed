@@ -8,13 +8,15 @@ Functionality of swapping optimizer tensors to/from (NVMe) storage devices.
 import torch
 from deepspeed.ops.op_builder import AsyncIOBuilder
 from deepspeed import comm as dist
+from deepspeed.utils import instrument_w_nvtx
 
 from deepspeed.runtime.swap_tensor.constants import *
 from deepspeed.runtime.swap_tensor.utils import swap_in_tensors, swap_out_tensors, print_object
 from deepspeed.runtime.swap_tensor.async_swapper import AsyncTensorSwapper
 from deepspeed.runtime.swap_tensor.utils import get_sized_buffer
 from deepspeed.runtime.swap_tensor.optimizer_utils import OptimizerSwapper
-
+import time
+import os
 
 class OptimizerSwapOp(object):
 
@@ -33,6 +35,7 @@ class OptimizerSwapOp(object):
     def wait(self):
         assert self.wait_required
         assert self.aio_handle.wait() == self.num_ops
+        # print(f">>>>>>>>>>>>>>>>> Wait called pipelined_opt_swapper/wait >>>>>>>>>>>, matching {self.num_ops} ")
         self.wait_required = False
 
 
@@ -80,6 +83,8 @@ class PipelinedOptimizerSwapper(OptimizerSwapper):
         if dist.get_rank() == 0:
             print_object(obj=self, name='PipelinedOptimizerSwapper', exclude_list=self.print_exclude_list)
 
+        self.dist_opt_stack = []
+
     def initialize_parameters(self, parameters, src_tensors):
         self._initialize_parameters(parameters=parameters, src_tensors=src_tensors, aio_handle=self.write_aio_handle)
 
@@ -92,9 +97,13 @@ class PipelinedOptimizerSwapper(OptimizerSwapper):
                                                   fp32_parameters=fp32_parameters)
 
     def flush_gradients(self):
-        self._flush_gradient_swapper(self.gradient_swapper)
+        # self.write_aio_handle.wait()
+        try:
+            self._flush_gradient_swapper(self.gradient_swapper)
+        except Exception as e:
+            import pdb; pdb.set_trace()
 
-    def swap_in_optimizer_state(self, parameter, async_parameter):
+    def swap_in_optimizer_state(self, parameter, async_parameter, sub_group_id=0, rank=0):
         assert parameter is not None
         assert self.swap_ops[SYNC_SWAP_IN] is None
 
@@ -111,7 +120,9 @@ class PipelinedOptimizerSwapper(OptimizerSwapper):
                                                                         parameter=parameter)
 
         if self.swap_ops[SYNC_SWAP_IN]:
+            start_time = time.time()
             self.swap_ops[SYNC_SWAP_IN].wait()
+            print(f"-> read_wait[{rank}][{sub_group_id}]: {time.time()-start_time}")
 
         if self.async_swap_in and async_parameter is not None:
             assert self.swap_ops[ASYNC_SWAP_IN] is None
@@ -120,21 +131,40 @@ class PipelinedOptimizerSwapper(OptimizerSwapper):
 
         self._stop_timer(SWAP_IN_STATE_TIMER)
         self.timer_names.add(SWAP_IN_STATE_TIMER)
+        # print(f"*** Swapped in {self.swap_ops[SYNC_SWAP_IN].param_info.param_id}, free slots: {self.swap_buffer_manager.free_buffer_index}")
 
-    def swap_out_optimizer_state(self, parameter, async_swap):
+    
+    def swap_in_clear_prev(self):
+        # print(f"*** Swapped in clear {self.swap_ops[SYNC_SWAP_IN].param_info.param_id}, free slots: {self.swap_buffer_manager.free_buffer_index}")
+        if self.swap_ops[SYNC_SWAP_IN] is not None:
+            self.dist_opt_stack.append(self.swap_ops[SYNC_SWAP_IN])
+            self.swap_ops[SYNC_SWAP_IN] = None        
+        # self._flush_gradient_swapper(self.gradient_swapper)
+        
+
+    def swap_out_optimizer_state(self, parameter, async_swap, sub_group_id=0, rank=0):
         self._start_timer(SWAP_OUT_STATE_TIMER)
+        # print(f"*** Starting to swap-out {parameter.ds_id}, free slots: {self.swap_buffer_manager.free_buffer_index}")
+        # self._flush_gradient_swapper(self.gradient_swapper)
 
         if self.swap_ops[ASYNC_SWAP_OUT]:
             self._start_timer(ASYNC_SWAP_OUT_STATE_TIMER)
+            start_time = time.time()
             self._complete_swap_out(ASYNC_SWAP_OUT)
+            print(f"-> write_wait[{rank}][{sub_group_id}]: {time.time()-start_time}")
             self._stop_timer(ASYNC_SWAP_OUT_STATE_TIMER)
             self.timer_names.add(ASYNC_SWAP_OUT_STATE_TIMER)
+
+        if len(self.dist_opt_stack):
+            self.swap_ops[SYNC_SWAP_IN] = self.dist_opt_stack.pop()
+            # print(f"\t Adding to SWAP_IN stack [{rank}][{sub_group_id}]: {self.swap_ops[SYNC_SWAP_IN].param_info.param_id}")
 
         assert self.swap_ops[SYNC_SWAP_IN] is not None
         assert not self.swap_ops[SYNC_SWAP_IN].wait_required
         swap_op = self._swap_out_optimizer_state(aio_handle=self.write_aio_handle,
-                                                 parameter=parameter,
-                                                 swap_in_op=self.swap_ops[SYNC_SWAP_IN])
+                                                parameter=parameter,
+                                                swap_in_op=self.swap_ops[SYNC_SWAP_IN])
+        # print(f"---> Enqueuing in write_aio_handle {self.write_aio_handle.__hash__()}: {parameter.ds_id}, next: {async_swap}")
         self.swap_ops[SYNC_SWAP_IN] = None
 
         if self.async_swap_out and async_swap:
@@ -146,6 +176,7 @@ class PipelinedOptimizerSwapper(OptimizerSwapper):
         self._stop_timer(SWAP_OUT_STATE_TIMER)
         self.timer_names.add(SWAP_OUT_STATE_TIMER)
 
+    @instrument_w_nvtx
     def swap_out_gradients(self, parameter, gradient_offsets, gradient_tensors):
         self._swap_out_gradients(parameter=parameter,
                                  gradient_offsets=gradient_offsets,
@@ -221,7 +252,6 @@ class PipelinedOptimizerSwapper(OptimizerSwapper):
             if param_info.swapped_gradients:
                 swap_buffers += param_info.get_swap_gradient_buffers(parameter.grad)
                 swap_paths += param_info.get_swap_gradient_paths()
-
         swap_in_tensors(aio_handle, swap_buffers, swap_paths)
 
         if param_info.unswapped_gradients:
@@ -233,5 +263,4 @@ class PipelinedOptimizerSwapper(OptimizerSwapper):
                                      allocated_buffers=allocated_buffers,
                                      state_buffers=state_buffers,
                                      num_ops=len(swap_buffers))
-
         return swap_in_op

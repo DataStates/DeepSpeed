@@ -100,3 +100,6 @@ class DeepSpeedZeroOffloadOptimizerConfig(DeepSpeedConfigModel):
 
     dist_cpu_caching: float = 0.0
     """ Enable CPU caching of optimizer states when offloaded to NVMe (update in arbitrary order)."""
+
+    dist_opt_ratio: int = 0
+    """ Allow only one process at a time to read/write optimizer state subgroup from storage."""
