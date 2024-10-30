@@ -120,9 +120,7 @@ class PipelinedOptimizerSwapper(OptimizerSwapper):
                                                                         parameter=parameter)
 
         if self.swap_ops[SYNC_SWAP_IN]:
-            start_time = time.time()
             self.swap_ops[SYNC_SWAP_IN].wait()
-            print(f"-> read_wait[{rank}][{sub_group_id}]: {time.time()-start_time}")
 
         if self.async_swap_in and async_parameter is not None:
             assert self.swap_ops[ASYNC_SWAP_IN] is None
@@ -131,7 +129,6 @@ class PipelinedOptimizerSwapper(OptimizerSwapper):
 
         self._stop_timer(SWAP_IN_STATE_TIMER)
         self.timer_names.add(SWAP_IN_STATE_TIMER)
-        # print(f"*** Swapped in {self.swap_ops[SYNC_SWAP_IN].param_info.param_id}, free slots: {self.swap_buffer_manager.free_buffer_index}")
 
     
     def swap_in_clear_prev(self):
@@ -144,14 +141,10 @@ class PipelinedOptimizerSwapper(OptimizerSwapper):
 
     def swap_out_optimizer_state(self, parameter, async_swap, sub_group_id=0, rank=0):
         self._start_timer(SWAP_OUT_STATE_TIMER)
-        # print(f"*** Starting to swap-out {parameter.ds_id}, free slots: {self.swap_buffer_manager.free_buffer_index}")
-        # self._flush_gradient_swapper(self.gradient_swapper)
 
         if self.swap_ops[ASYNC_SWAP_OUT]:
-            self._start_timer(ASYNC_SWAP_OUT_STATE_TIMER)
-            start_time = time.time()
-            self._complete_swap_out(ASYNC_SWAP_OUT)
-            print(f"-> write_wait[{rank}][{sub_group_id}]: {time.time()-start_time}")
+            self._start_timer(ASYNC_SWAP_OUT_STATE_TIMER)            
+            self._complete_swap_out(ASYNC_SWAP_OUT, rank)
             self._stop_timer(ASYNC_SWAP_OUT_STATE_TIMER)
             self.timer_names.add(ASYNC_SWAP_OUT_STATE_TIMER)
 
@@ -164,14 +157,13 @@ class PipelinedOptimizerSwapper(OptimizerSwapper):
         swap_op = self._swap_out_optimizer_state(aio_handle=self.write_aio_handle,
                                                 parameter=parameter,
                                                 swap_in_op=self.swap_ops[SYNC_SWAP_IN])
-        # print(f"---> Enqueuing in write_aio_handle {self.write_aio_handle.__hash__()}: {parameter.ds_id}, next: {async_swap}")
         self.swap_ops[SYNC_SWAP_IN] = None
 
         if self.async_swap_out and async_swap:
             self.swap_ops[ASYNC_SWAP_OUT] = swap_op
         else:
             self.swap_ops[SYNC_SWAP_OUT] = swap_op
-            self._complete_swap_out(SYNC_SWAP_OUT)
+            self._complete_swap_out(SYNC_SWAP_OUT, rank)
 
         self._stop_timer(SWAP_OUT_STATE_TIMER)
         self.timer_names.add(SWAP_OUT_STATE_TIMER)
@@ -183,15 +175,29 @@ class PipelinedOptimizerSwapper(OptimizerSwapper):
                                  gradient_tensors=gradient_tensors,
                                  gradient_swapper=self.gradient_swapper)
 
-    def _complete_swap_out(self, swap_out_type):
+    def _complete_swap_out(self, swap_out_type, rank = -1):
+        start_time = time.time()
         self.swap_ops[swap_out_type].wait()
+        num_swap_outs = 0
         for i in range(len(self.swap_ops[swap_out_type].state_buffers)):
-            self.swap_ops[swap_out_type].state_buffers[i] = torch.Tensor()
+            # print(f">>>>> Going to release memory at {self.swap_ops[swap_out_type].state_buffers[i].__hash__()}")
+            self.swap_ops[swap_out_type].state_buffers[i] = torch.Tensor()            
+            num_swap_outs += 1
+        # if len(self.swap_ops[swap_out_type].state_buffers) >= 2:
+        #     print(f"Trying to swap out more than 2 elements {len(self.swap_ops[swap_out_type].state_buffers[i])}")
+        #     import pdb; pdb.set_trace()
         self.swap_buffer_manager.free(self.swap_ops[swap_out_type].allocated_buffers)
         self.swap_ops[swap_out_type] = None
+        print(f"-> complete_swap_out[{rank}][-1]: {time.time()-start_time}")
 
     def _swap_out_optimizer_state(self, aio_handle, parameter, swap_in_op):
-        assert swap_in_op.is_parameter(parameter)
+        try:
+            assert swap_in_op.is_parameter(parameter)
+        except Exception as e:
+            print(f"Got error as {e}")
+            if dist.get_rank() == 0:
+                import pdb; pdb.set_trace()
+            dist.barrier()
 
         allocated_buffers = swap_in_op.allocated_buffers.copy()
         swap_buffers = swap_in_op.state_buffers.copy()
