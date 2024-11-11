@@ -84,6 +84,7 @@ void deepspeed_aio_thread_t::run()
             std::unique_ptr<io_xfer_ctxt> xfer_ctxt(new io_xfer_ctxt(
                 next_io_op->_fd, base_offset, next_io_op->_num_bytes, next_io_op->data_ptr()));
 
+            _aio_config.acquire_ipc_lock();
             if (_aio_config._overlap_events) {
                 do_aio_operation_overlap(
                     next_io_op->_read_op, _aio_ctxt, xfer_ctxt, &_aio_config, nullptr);
@@ -97,6 +98,7 @@ void deepspeed_aio_thread_t::run()
                 _complete_queue.push(next_io_op);
             }
             _complete_sync._cond_var.notify_one();
+            _aio_config.release_ipc_lock();
         }
 
         if (_time_to_exit) { break; }

@@ -11,6 +11,7 @@ Functionality for swapping optimizer tensors to/from (NVMe) storage devices.
 */
 
 #include "deepspeed_py_aio_handle.h"
+#include <unistd.h>
 
 using namespace std;
 
@@ -20,12 +21,13 @@ deepspeed_aio_handle_t::deepspeed_aio_handle_t(const int block_size,
                                                const int queue_depth,
                                                const bool single_submit,
                                                const bool overlap_events,
-                                               const int num_threads)
+                                               const int num_threads,
+                                               std::string lock_name)
     : _aio_ctxt(new aio_context(block_size, queue_depth)),
       _single_submit(single_submit),
       _overlap_events(overlap_events),
       _num_threads(num_threads),
-      _aio_config(block_size, queue_depth, single_submit, overlap_events, false),
+      _aio_config(block_size, queue_depth, single_submit, overlap_events, false, lock_name, getpid()),
       _num_pending_ops(0),
       _pinned_tensor_mgr(new deepspeed_pin_tensor_t())
 {

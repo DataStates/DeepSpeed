@@ -31,7 +31,8 @@ struct deepspeed_aio_handle_t {
                            const int queue_depth,
                            const bool single_submit,
                            const bool overlap_events,
-                           const int num_threads);
+                           const int num_threads,
+                           std::string lock_name = "");
 
     ~deepspeed_aio_handle_t();
 

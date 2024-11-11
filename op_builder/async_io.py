@@ -29,7 +29,7 @@ class AsyncIOBuilder(OpBuilder):
         ]
 
     def include_paths(self):
-        return ['csrc/aio/py_lib', 'csrc/aio/common']
+        return ['csrc/aio/py_lib', 'csrc/aio/common', '/home/amaurya/softwares/boost/boost_1_72_0/']
 
     def cxx_args(self):
         # -O0 for improved debugging, since performance is bound by I/O
@@ -53,6 +53,8 @@ class AsyncIOBuilder(OpBuilder):
             '-fopenmp',
             SIMD_WIDTH,
             '-laio',
+            '-lboost_system',
+            '-lboost_thread'
         ]
 
     def extra_ldflags(self):

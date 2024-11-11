@@ -170,12 +170,12 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
         self.partial_offload = offload_ratio
 
 
-        temp_path = pathlib.Path('/dev/shm/dist_opt_read_lock.file')
-        temp_path.unlink(missing_ok=True)
-        temp_path = pathlib.Path('/dev/shm/dist_opt_write_lock.file')
-        temp_path.unlink(missing_ok=True)
-        self.dist_opt_read_lock = fasteners.InterProcessLock('/dev/shm/dist_opt_read_lock.file')
-        self.dist_opt_write_lock = fasteners.InterProcessLock('/dev/shm/dist_opt_write_lock.file')
+        # temp_path = pathlib.Path('/dev/shm/dist_opt_read_lock.file')
+        # temp_path.unlink(missing_ok=True)
+        # temp_path = pathlib.Path('/dev/shm/dist_opt_write_lock.file')
+        # temp_path.unlink(missing_ok=True)
+        # self.dist_opt_read_lock = fasteners.InterProcessLock('/dev/shm/dist_opt_read_lock.file')
+        # self.dist_opt_write_lock = fasteners.InterProcessLock('/dev/shm/dist_opt_write_lock.file')
         
         self.dist_opt_seq_update = True
         self.dist_opt_cached_subgroups = {}
@@ -2278,11 +2278,11 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
 
             #prepare optimizer states, gradients and fp32 parameters for update
             t = time.time()
-            if self.dist_opt_one_at_time:
-                self.dist_opt_read_lock.acquire()
+            # if self.dist_opt_one_at_time:
+            #     self.dist_opt_read_lock.acquire()
             self._prepare_sub_group(sub_group_id, timer_names)
-            if self.dist_opt_one_at_time:
-                self.dist_opt_read_lock.release()
+            # if self.dist_opt_one_at_time:
+            #     self.dist_opt_read_lock.release()
             print(f"-> read_wait[{self.dist_opt_my_rank}][{sub_group_id}]: {time.time()-t}")
 
             t = time.time()
@@ -2301,14 +2301,14 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
 
             #put fp16 parameters in appropriate location
             t = time.time()
-            if self.dist_opt_one_at_time:
-                self.dist_opt_write_lock.acquire()
+            # if self.dist_opt_one_at_time:
+            #     self.dist_opt_write_lock.acquire()
             self._reassign_or_swap_out_partitioned_parameters(sub_group_id)
 
             #release memory or swap out optimizer states of fp32 parameters
             self._release_sub_group(sub_group_id, timer_names)
-            if self.dist_opt_one_at_time:
-                self.dist_opt_write_lock.release()
+            # if self.dist_opt_one_at_time:
+            #     self.dist_opt_write_lock.release()
             print(f"-> write_wait[{self.dist_opt_my_rank}][{sub_group_id}]: {time.time()-t}")
         
         self.timers(OPTIMIZER_STEP_TIMER).stop()

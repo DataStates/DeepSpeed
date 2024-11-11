@@ -28,6 +28,7 @@ Functionality for swapping optimizer tensors to/from (NVMe) storage devices.
 #include <memory>
 #include <string>
 #include <vector>
+#include <unistd.h>
 
 #include "deepspeed_py_aio.h"
 
@@ -48,7 +49,7 @@ int deepspeed_py_aio_write(const torch::Tensor& buffer,
                            const bool validate)
 {
     const auto start_time = std::chrono::high_resolution_clock::now();
-    deepspeed_aio_config_t config(block_size, queue_depth, single_submit, overlap_events, false);
+    deepspeed_aio_config_t config(block_size, queue_depth, single_submit, overlap_events, false, "dummy_w", getpid());
 
     const auto fd = open_file(filename, false);
     if (fd == -1) { return -1; }
@@ -94,7 +95,7 @@ int deepspeed_py_aio_read(torch::Tensor& buffer,
         return -1;
     }
 
-    deepspeed_aio_config_t config(block_size, queue_depth, single_submit, overlap_events, false);
+    deepspeed_aio_config_t config(block_size, queue_depth, single_submit, overlap_events, false, "dummy_r", getpid());
     const auto fd = open_file(filename, true);
     if (fd == -1) { return -1; }
 

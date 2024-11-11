@@ -11,6 +11,7 @@ import hashlib
 from collections import defaultdict, OrderedDict, deque
 from shutil import copyfile
 import gc
+import time
 
 from torch.nn.modules import Module
 from torch.nn.parameter import Parameter
@@ -1794,7 +1795,8 @@ class DeepSpeedEngine(Module):
             *inputs: Variable length input list
             **kwargs: variable length keyword arguments
         """
-
+        if self.local_rank == 0:
+            print(f"-> forward:start:{time.time_ns()}")
         if self.autotuning_profile_model_info():
             ma = get_ma_status()
         else:
@@ -1868,6 +1870,8 @@ class DeepSpeedEngine(Module):
             exit()
         else:
             see_memory_usage("Engine after forward", force=self.memory_breakdown())
+        if self.local_rank == 0:
+            print(f"-> forward:stop:{time.time_ns()}")
         return loss
 
     def _cast_inputs_half(self, inputs):
@@ -1938,6 +1942,8 @@ class DeepSpeedEngine(Module):
             retain_graph: bool, default: false
                 forward on user defined choice of retain_graph
         """
+        if self.local_rank == 0:
+            print(f"-> backward:start:{time.time_ns()}")
 
         see_memory_usage("Engine before backward", force=self.memory_breakdown())
 
@@ -2010,7 +2016,8 @@ class DeepSpeedEngine(Module):
             pass
 
         see_memory_usage("Engine after backward", force=self.memory_breakdown())
-
+        if self.local_rank == 0:
+            print(f"-> backward:stop:{time.time_ns()}")
         return loss
 
     def is_gradient_accumulation_boundary(self):
@@ -2133,6 +2140,8 @@ class DeepSpeedEngine(Module):
         r"""Execute the weight update step after forward and backward propagation
         on effective_train_batch.
         """
+        if self.local_rank == 0:
+            print(f"-> update:start:{time.time_ns()}")
         see_memory_usage("Engine before step", force=self.memory_breakdown())
 
         # Check early because self.global_steps is incremented at some point here.
@@ -2234,6 +2243,8 @@ class DeepSpeedEngine(Module):
 
         self.micro_steps += 1
         see_memory_usage("Engine after step", force=self.memory_breakdown())
+        if self.local_rank == 0:
+            print(f"-> update:stop:{time.time_ns()}")
 
     def _start_timers(self, timer_names):
         for name in timer_names:

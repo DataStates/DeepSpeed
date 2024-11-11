@@ -58,13 +58,20 @@ class PipelinedOptimizerSwapper(OptimizerSwapper):
                                                         device, dtype, timers)
 
         aio_op = AsyncIOBuilder().load()
+        rlock_name = ""
+        wlock_name = ""        
+        if swap_config.dist_opt_one_at_time:
+            base_path = os.path.normpath(base_folder).lstrip(os.sep).split(os.sep)[0]
+            wlock_name = f"wlock-{base_path}"
+            rlock_name = f"rlock-{base_path}"
+        
         self.write_aio_handle = aio_op.aio_handle(aio_config[AIO_BLOCK_SIZE], aio_config[AIO_QUEUE_DEPTH],
                                                   aio_config[AIO_SINGLE_SUBMIT], aio_config[AIO_OVERLAP_EVENTS],
-                                                  aio_config[AIO_THREAD_COUNT])
-
+                                                  aio_config[AIO_THREAD_COUNT], wlock_name)
+        
         self.read_aio_handle = aio_op.aio_handle(aio_config[AIO_BLOCK_SIZE], aio_config[AIO_QUEUE_DEPTH],
                                                  aio_config[AIO_SINGLE_SUBMIT], aio_config[AIO_OVERLAP_EVENTS],
-                                                 aio_config[AIO_THREAD_COUNT])
+                                                 aio_config[AIO_THREAD_COUNT], rlock_name)
 
         # Overlap gradient swap out
         self.gradient_swapper = AsyncTensorSwapper(aio_handle=self.write_aio_handle,

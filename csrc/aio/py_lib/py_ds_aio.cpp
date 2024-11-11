@@ -20,7 +20,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("deepspeed_memcpy", &deepspeed_py_memcpy, "DeepSpeed Memory Copy");
 
     py::class_<deepspeed_aio_handle_t>(m, "aio_handle")
-        .def(py::init<const int, const int, const bool, const bool, const int>())
+        .def(py::init<const int, const int, const bool, const bool, const int, std::string>())
 
         .def("get_block_size", &deepspeed_aio_handle_t::get_block_size)
         .def("get_queue_depth", &deepspeed_aio_handle_t::get_queue_depth)
