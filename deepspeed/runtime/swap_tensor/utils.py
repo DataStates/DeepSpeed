@@ -9,22 +9,30 @@ Functionality of swapping tensors to/from (NVMe) storage devices.
 import torch
 from deepspeed.utils.logging import logger
 from deepspeed.accelerator import get_accelerator
-
 from deepspeed import comm as dist
 
 MIN_AIO_BYTES = 1024**2
 AIO_ALIGNED_BYTES = 1024
 
 
-def swap_in_tensors(swap_handle, tensor_buffers, swap_paths):
+def swap_in_tensors(swap_handle, tensor_buffers, swap_paths, one_at_time = 0):
+    # n = len(tensor_buffers)-1 if one_at_time else 0
+    n = 0    
     for buffer, path in zip(tensor_buffers, swap_paths):
-        assert (swap_handle.async_pread(buffer, path) == 0)
+        assert (swap_handle.async_pread(buffer, path, n) == 0)
+        n = max(0, n-1)
 
 
-def swap_out_tensors(swap_handle, tensor_buffers, swap_paths):
+def swap_out_tensors(swap_handle, tensor_buffers, swap_paths, one_at_time = 0):
+    # n = len(tensor_buffers)-1 if one_at_time else 0
+    n = 0
+    final_sizes = {}
     for buffer, path in zip(tensor_buffers, swap_paths):
-        assert (swap_handle.async_pwrite(buffer, path) == 0)
-
+        # assert (swap_handle.async_pwrite(buffer, path, n) == 0)
+        comp_size = swap_handle.async_pwrite(buffer, path, n)
+        final_sizes[path] = comp_size
+        n = max(0, n-1)
+    return final_sizes
 
 def print_object(obj, name, exclude_list=[]):
     logger.info('{}:'.format(name))

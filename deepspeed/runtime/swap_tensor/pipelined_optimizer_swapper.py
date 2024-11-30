@@ -60,18 +60,24 @@ class PipelinedOptimizerSwapper(OptimizerSwapper):
         aio_op = AsyncIOBuilder().load()
         rlock_name = ""
         wlock_name = ""        
-        if swap_config.dist_opt_one_at_time:
+        enable_compression = 0
+        self.dist_opt_one_at_time = (swap_config.dist_opt_one_at_time) and ("vast" in base_folder)
+        if self.dist_opt_one_at_time:
             base_path = os.path.normpath(base_folder).lstrip(os.sep).split(os.sep)[0]
             wlock_name = f"wlock-{base_path}"
-            rlock_name = f"rlock-{base_path}"
+            rlock_name = f"wlock-{base_path}"
         
+        if swap_config.dist_opt_compress:
+            enable_compression = 1
+        
+        largest_buffer_size_bytes = largest_numel * (torch.finfo(dtype).bits // 8)
         self.write_aio_handle = aio_op.aio_handle(aio_config[AIO_BLOCK_SIZE], aio_config[AIO_QUEUE_DEPTH],
                                                   aio_config[AIO_SINGLE_SUBMIT], aio_config[AIO_OVERLAP_EVENTS],
-                                                  aio_config[AIO_THREAD_COUNT], wlock_name)
+                                                  aio_config[AIO_THREAD_COUNT], largest_buffer_size_bytes, wlock_name, enable_compression)
         
         self.read_aio_handle = aio_op.aio_handle(aio_config[AIO_BLOCK_SIZE], aio_config[AIO_QUEUE_DEPTH],
                                                  aio_config[AIO_SINGLE_SUBMIT], aio_config[AIO_OVERLAP_EVENTS],
-                                                 aio_config[AIO_THREAD_COUNT], rlock_name)
+                                                 aio_config[AIO_THREAD_COUNT], largest_buffer_size_bytes, rlock_name, enable_compression)
 
         # Overlap gradient swap out
         self.gradient_swapper = AsyncTensorSwapper(aio_handle=self.write_aio_handle,
@@ -161,7 +167,7 @@ class PipelinedOptimizerSwapper(OptimizerSwapper):
 
         assert self.swap_ops[SYNC_SWAP_IN] is not None
         assert not self.swap_ops[SYNC_SWAP_IN].wait_required
-        swap_op = self._swap_out_optimizer_state(aio_handle=self.write_aio_handle,
+        swap_op, comp_sizes = self._swap_out_optimizer_state(aio_handle=self.write_aio_handle,
                                                 parameter=parameter,
                                                 swap_in_op=self.swap_ops[SYNC_SWAP_IN])
         self.swap_ops[SYNC_SWAP_IN] = None
@@ -174,6 +180,7 @@ class PipelinedOptimizerSwapper(OptimizerSwapper):
 
         self._stop_timer(SWAP_OUT_STATE_TIMER)
         self.timer_names.add(SWAP_OUT_STATE_TIMER)
+        return comp_sizes
 
     @instrument_w_nvtx
     def swap_out_gradients(self, parameter, gradient_offsets, gradient_tensors):
@@ -230,7 +237,9 @@ class PipelinedOptimizerSwapper(OptimizerSwapper):
         swap_paths = param_info.swap_paths.copy()
         assert len(swap_paths) == len(swap_buffers)
 
-        swap_out_tensors(aio_handle, swap_buffers, swap_paths)
+        # if self.dist_opt_one_at_time == 0:
+        #     import pdb; pdb.set_trace()
+        comp_sizes = swap_out_tensors(aio_handle, swap_buffers, swap_paths, self.dist_opt_one_at_time)
 
         swap_out_op = OptimizerSwapOp(aio_handle=aio_handle,
                                       param_info=param_info,
@@ -239,7 +248,7 @@ class PipelinedOptimizerSwapper(OptimizerSwapper):
                                       state_buffers=swap_buffers,
                                       num_ops=len(swap_buffers))
 
-        return swap_out_op
+        return swap_out_op, comp_sizes
 
     def _swap_in_optimizer_state(self, aio_handle, parameter):
         param_info = self._get_param_swap_info(parameter)
@@ -265,7 +274,7 @@ class PipelinedOptimizerSwapper(OptimizerSwapper):
             if param_info.swapped_gradients:
                 swap_buffers += param_info.get_swap_gradient_buffers(parameter.grad)
                 swap_paths += param_info.get_swap_gradient_paths()
-        swap_in_tensors(aio_handle, swap_buffers, swap_paths)
+        swap_in_tensors(aio_handle, swap_buffers, swap_paths, self.dist_opt_one_at_time)
 
         if param_info.unswapped_gradients:
             self._retrieve_unswapped_grad_partitions(swap_info=param_info, dest_buffer=parameter.grad)

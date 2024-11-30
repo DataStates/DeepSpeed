@@ -104,8 +104,11 @@ class DeepSpeedZeroOffloadOptimizerConfig(DeepSpeedConfigModel):
     dist_opt_grad_skip: bool = 0
     """ Skip flushing of gradients when optimizer states are offloaded to NVMe (update in arbitrary order)."""
 
-    dist_opt_one_at_time: bool = 0
+    dist_opt_one_at_time: int = 0
     """ Only allow one process to do aio read/write of optimizer states when offloaded to NVMe."""
 
     dist_opt_ratio: int = 0
     """ Allow only one process at a time to read/write optimizer state subgroup from storage."""
+
+    dist_opt_compress: int = 0
+    """ Use compression for accelerating read/write of optimizer states when offloaded to NVMe."""

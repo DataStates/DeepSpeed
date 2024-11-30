@@ -21,13 +21,24 @@ struct io_op_desc_t {
     torch::Tensor _cpu_buffer;
     torch::Tensor _contiguous_buffer;
     const bool _validate;
+    int _batch_len = -1;
+    uint8_t* _buffer_ptr = nullptr;
 
     io_op_desc_t(const bool read_op,
                  const torch::Tensor& buffer,
                  const int fd,
                  const char* filename,
                  const long long int num_bytes,
-                 const bool validate);
+                 const bool validate,
+                 int batch_len = -1);
+        
+    io_op_desc_t(const bool read_op,
+                 uint8_t* buffer_ptr,
+                 const int fd,
+                 const char* filename,
+                 const long long int num_bytes,
+                 const bool validate,
+                 int batch_len = -1);
 
     char* data_ptr() const;
     void fini();

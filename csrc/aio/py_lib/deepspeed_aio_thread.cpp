@@ -8,7 +8,7 @@ Functionality for swapping optimizer tensors to/from (NVMe) storage devices.
 */
 
 #include "deepspeed_aio_thread.h"
-
+#include <chrono>
 #if defined(__ENABLE_CANN__)
 #include "torch_npu/csrc/framework/utils/OpAdapter.h"
 #include "torch_npu/csrc/framework/utils/UtilForOpAdapter.h"
@@ -21,13 +21,15 @@ io_op_desc_t::io_op_desc_t(const bool read_op,
                            const int fd,
                            const char* filename,
                            const long long int num_bytes,
-                           const bool validate)
+                           const bool validate,
+                           int batch_len)
     : _read_op(read_op),
       _buffer(buffer),
       _fd(fd),
       _filename(filename),
       _num_bytes(num_bytes),
-      _validate(validate)
+      _validate(validate),
+      _batch_len(batch_len)
 {
     _cpu_buffer = (_buffer.is_cuda() || _buffer.is_xpu()
 #if defined(__ENABLE_CANN__)
@@ -37,9 +39,36 @@ io_op_desc_t::io_op_desc_t(const bool read_op,
                       ? _buffer.to(torch::kCPU).pin_memory()
                       : _buffer;
     _contiguous_buffer = _cpu_buffer.contiguous();
+    _buffer_ptr = nullptr;
 }
 
-char* io_op_desc_t::data_ptr() const { return (char*)_contiguous_buffer.data_ptr(); }
+
+io_op_desc_t::io_op_desc_t(const bool read_op,
+                           uint8_t* buffer_ptr,
+                           const int fd,
+                           const char* filename,
+                           const long long int num_bytes,
+                           const bool validate,
+                           int batch_len)
+    : _read_op(read_op),
+      _buffer_ptr(buffer_ptr),
+      _fd(fd),
+      _filename(filename),
+      _num_bytes(num_bytes),
+      _validate(validate),
+      _batch_len(batch_len)
+{
+    _buffer = torch::empty(0);
+    _cpu_buffer = torch::empty(0);
+    _contiguous_buffer = torch::empty(0);
+
+}
+
+char* io_op_desc_t::data_ptr() const { 
+    if (_buffer_ptr != nullptr)
+        return (char*)_buffer_ptr;
+    return (char*)_contiguous_buffer.data_ptr(); 
+}
 
 void io_op_desc_t::fini()
 {
@@ -85,6 +114,7 @@ void deepspeed_aio_thread_t::run()
                 next_io_op->_fd, base_offset, next_io_op->_num_bytes, next_io_op->data_ptr()));
 
             _aio_config.acquire_ipc_lock();
+            auto start = std::chrono::high_resolution_clock::now();
             if (_aio_config._overlap_events) {
                 do_aio_operation_overlap(
                     next_io_op->_read_op, _aio_ctxt, xfer_ctxt, &_aio_config, nullptr);
@@ -98,6 +128,15 @@ void deepspeed_aio_thread_t::run()
                 _complete_queue.push(next_io_op);
             }
             _complete_sync._cond_var.notify_one();
+            auto stop = std::chrono::high_resolution_clock::now();
+
+            // if (next_io_op->_read_op == false && next_io_op->_buffer_ptr != nullptr) {
+            //     free(next_io_op->_buffer_ptr);
+            // }
+            
+            // if (next_io_op->_read_op == false) {
+            //     std::cout << "[BYTES = " << next_io_op->_num_bytes << ", OFFSET = " << base_offset << ", TIME = "<< std::chrono::duration_cast<std::chrono::microseconds>(stop-start).count() << ", ADDR = " << (void*)next_io_op->data_ptr() << "]" << std::endl;
+            // }
             _aio_config.release_ipc_lock();
         }
 

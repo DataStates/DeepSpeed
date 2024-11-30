@@ -54,11 +54,13 @@ class AsyncIOBuilder(OpBuilder):
             SIMD_WIDTH,
             '-laio',
             '-lboost_system',
-            '-lboost_thread'
+            '-lboost_thread',
+            '-lzstd',
+            '-DZSTD_STATIC_LINKING_ONLY'
         ]
 
     def extra_ldflags(self):
-        return ['-laio']
+        return ['-laio', '-lzstd']
 
     def check_for_libaio_pkg(self):
         libs = dict(

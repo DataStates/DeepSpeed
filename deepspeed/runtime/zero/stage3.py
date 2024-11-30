@@ -30,9 +30,8 @@ from deepspeed.runtime.swap_tensor.pipelined_optimizer_swapper import PipelinedO
 from deepspeed.checkpoint.constants import OPTIMIZER_STATE_DICT, FP32_FLAT_GROUPS, PARTITION_COUNT, ZERO_STAGE, LOSS_SCALER
 from deepspeed.accelerator import get_accelerator
 from deepspeed.utils import z3_leaf_parameter
-import fasteners
-import pathlib
 import numpy as np
+
 
 # Toggle this to true to enable correctness test
 # with gradient partitioning and without
@@ -191,6 +190,8 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
         self.dist_opt_ratio = 2
         self.dist_opt_grad_skip = False
         self.dist_opt_enable_caching = True
+        self.dist_opt_step_iter = -1
+        self.dist_opt_comp_ratio = {"p": {}, "m": {}, "v": {}}
 
         #num of ranks in a ZeRO param partitioning group
         self.zero_hpz_partition_size = zero_hpz_partition_size
@@ -598,6 +599,7 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
             self.offload_optimizer_fast_init = offload_optimizer_config.fast_init
             self.dist_opt_enable_caching = offload_optimizer_config.dist_opt_enable_caching
             self.dist_opt_one_at_time = offload_optimizer_config.dist_opt_one_at_time
+            self.dist_opt_compress = offload_optimizer_config.dist_opt_compress
             self.dist_opt_ratio = offload_optimizer_config.dist_opt_ratio
             self.dist_opt_grad_skip = offload_optimizer_config.dist_opt_grad_skip
 
@@ -634,7 +636,7 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
             self.optimizer_swapper.append(swapper)
         self.dist_opt_buffer_count = (offload_optimizer_config.buffer_count // 4) - 1 # for p, m, v, g
         if self.dist_opt_grad_skip:
-            self.dist_opt_buffer_count = (offload_optimizer_config.buffer_count // 3) - 1 # for p, m, v
+            self.dist_opt_buffer_count = (offload_optimizer_config.buffer_count // 3) # for p, m, v
     
     @property
     def elements_in_ipg_bucket(self):
@@ -1035,7 +1037,6 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
             cur_device = self.subgroup_to_device[sub_group_id]
             if cur_device == 'cpu':
                 self.optimizer.param_groups[param_group_id]['params'] = [fp32_param]
-                # import pdb; pdb.set_trace()   
                 cpu_loss = self.optimizer.step()
                 self.optimizer.param_groups[param_group_id]['params'] = []
             else:
@@ -2144,12 +2145,29 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
             # if self.dist_opt_grad_skip:            
             # logger.info(f"*** Going to flush out {sub_group_id}: {self.fp32_partitioned_groups_flat[sub_group_id].ds_id}, {self.fp32_partitioned_groups_flat[sub_group_id].__hash__()}")
             # logger.info(f"*** GOING TO FLUSH OUT: {sub_group_id}: {self.fp32_partitioned_groups_flat[sub_group_id].ds_id}, from {swapper_id}, async_swap_next = {async_swap_next} with free indexes at: {self._get_opt_swapper(sub_group_id).swap_buffer_manager.free_buffer_index} ***")
-            self._get_opt_swapper(sub_group_id).swap_out_optimizer_state(
+            comp_sizes = self._get_opt_swapper(sub_group_id).swap_out_optimizer_state(
                 parameter=self.fp32_partitioned_groups_flat[sub_group_id],
                 async_swap=async_swap_next,
                 sub_group_id=sub_group_id,
                 rank=self.dist_opt_my_rank)
             self.dist_opt_cached_subgroups[sub_group_id] = False
+
+            if self.dist_opt_step_iter >= 1:
+                orig_tensor_size = self.fp32_partitioned_groups_flat[sub_group_id].numel()*self.fp32_partitioned_groups_flat[sub_group_id].element_size()
+                if self.dist_opt_step_iter not in self.dist_opt_comp_ratio["p"]:
+                    self.dist_opt_comp_ratio["p"][self.dist_opt_step_iter] = []
+                    self.dist_opt_comp_ratio["m"][self.dist_opt_step_iter] = []
+                    self.dist_opt_comp_ratio["v"][self.dist_opt_step_iter] = []
+
+                for k, v in comp_sizes.items():
+                    v = v/orig_tensor_size
+                    if "exp_avg_sq-" in k:
+                        self.dist_opt_comp_ratio["v"][self.dist_opt_step_iter].append(v)
+                    elif "exp_avg-" in k:
+                        self.dist_opt_comp_ratio["m"][self.dist_opt_step_iter].append(v)
+                    else:
+                        self.dist_opt_comp_ratio["p"][self.dist_opt_step_iter].append(v)
+            # print(comp_sizes)
             # self.fp32_partitioned_groups_flat[sub_group_id].data = torch.zeros((1,), dtype=torch.float32)
             # gc.collect()
             # get rid of the fp32 gradients. Not needed anymore            
@@ -2241,6 +2259,14 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
         """
             Not supporting closure.
         """
+        my_timers = {}
+        my_timers["time"] = time.time()
+        my_timers["read_time"] = 0
+        my_timers["compute_time"] = 0
+        my_timers["write_time"] = 0
+        my_timers["others"] = 0
+        self.dist_opt_step_iter += 1
+
         if self.dist_opt_enable_caching:
             for swapper in self.optimizer_swapper:
                 swapper.flush_gradients()
@@ -2272,22 +2298,19 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
             update_order.reverse()
         print(f" --- Updating in order: {update_order}")
 
+        my_timers["others"] = time.time()-my_timers["time"]
+
         #update parameters one sub group at a time
         # for sub_group_id, group in enumerate(self.fp16_groups):
         for sub_group_id in update_order:
 
             #prepare optimizer states, gradients and fp32 parameters for update
             t = time.time()
-            # if self.dist_opt_one_at_time:
-            #     self.dist_opt_read_lock.acquire()
             self._prepare_sub_group(sub_group_id, timer_names)
-            # if self.dist_opt_one_at_time:
-            #     self.dist_opt_read_lock.release()
             print(f"-> read_wait[{self.dist_opt_my_rank}][{sub_group_id}]: {time.time()-t}")
+            my_timers["read_time"] += time.time()-t
 
             t = time.time()
-            # if self.dist_opt_one_at_time:
-            #     self.dist_opt_update_lock.acquire()
             #scale the fp32 gradients
             if self.fp32_partitioned_groups_flat[sub_group_id] is None:
                 import pdb; pdb.set_trace()
@@ -2295,22 +2318,21 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
 
             #apply the optimizer step on the sub group and copy fp32 parameters to fp16
             self._optimizer_step(sub_group_id)
-            # if self.dist_opt_one_at_time:
-            #     self.dist_opt_update_lock.release()
             print(f"-> compute_wait[{self.dist_opt_my_rank}][{sub_group_id}]: {time.time()-t}")
+            my_timers["compute_time"] += time.time()-t
 
             #put fp16 parameters in appropriate location
             t = time.time()
-            # if self.dist_opt_one_at_time:
-            #     self.dist_opt_write_lock.acquire()
             self._reassign_or_swap_out_partitioned_parameters(sub_group_id)
+            # print(f"    -> reassignment_wait[{self.dist_opt_my_rank}][{sub_group_id}]: {time.time()-t}")
 
             #release memory or swap out optimizer states of fp32 parameters
             self._release_sub_group(sub_group_id, timer_names)
-            # if self.dist_opt_one_at_time:
-            #     self.dist_opt_write_lock.release()
+
             print(f"-> write_wait[{self.dist_opt_my_rank}][{sub_group_id}]: {time.time()-t}")
+            my_timers["write_time"] += time.time()-t
         
+        t = time.time()
         self.timers(OPTIMIZER_STEP_TIMER).stop()
 
 
@@ -2339,6 +2361,15 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
                     "that all ranks flush their caches at the same time",
                     alloc_retries - self.n_caching_allocator_flushes)
             self.n_caching_allocator_flushes = alloc_retries
+        
+        my_timers["others"] += time.time()-t
+        my_timers["time"] = time.time()- my_timers["time"]
+
+        print(f"COMP_RATIOS: ({self.dist_opt_comp_ratio})")
+        x = self.dist_opt_comp_ratio
+        print({k: {l: sum(i)/len(i) for l, i in v.items()} for k,v in x.items()})
+        print(f"----- Rank [{self.dist_opt_my_rank}] took {my_timers}")
+        # dist.barrier()
 
     def dump_pre_step_gradients(self, debug_fp32_grads):
         # Dump gradient norms for debugging

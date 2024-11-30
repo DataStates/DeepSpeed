@@ -102,9 +102,9 @@ bool deepspeed_aio_config_t::acquire_ipc_lock() {
                 _ipc_has_lock.store(true);
                 break;
             } else {
-                // boost::interprocess::scoped_lock<boost::interprocess::named_mutex> lock(*_ipc_mutex);
-                // _ipc_cond->wait(lock);
-                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                boost::interprocess::scoped_lock<boost::interprocess::named_mutex> lock(*_ipc_mutex);
+                _ipc_cond->wait(lock);
+                // std::this_thread::sleep_for(std::chrono::milliseconds(1));
             }
         }
     }
