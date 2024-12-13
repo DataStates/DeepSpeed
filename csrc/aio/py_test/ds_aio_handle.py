@@ -22,7 +22,7 @@ def pre_handle(args, tid, read_op):
 
     io_parallel = args.io_parallel if args.io_parallel else 1
     handle = AsyncIOBuilder().load().aio_handle(args.block_size, args.queue_depth, args.single_submit,
-                                                args.overlap_events, io_parallel)
+                                                args.overlap_events, io_parallel, 0, "", 0)
     task_log(tid, f'Created deepspeed aio handle')
 
     if args.gpu:
@@ -71,7 +71,7 @@ def main_parallel_read(pool_params):
     handle = ctxt['handle']
 
     start_time = time.time()
-    ret = handle.pread(ctxt['buffer'], ctxt['file'], args.validate, True)
+    ret = handle.pread(ctxt['buffer'], ctxt['file'], args.validate, True, 0)
     assert ret != -1
     handle.wait()
     end_time = time.time()
@@ -84,7 +84,7 @@ def main_parallel_write(pool_params):
     args, tid, ctxt = pool_params
     handle = ctxt['handle']
     start_time = time.time()
-    ret = handle.pwrite(ctxt['buffer'], ctxt['file'], args.validate, True)
+    ret = handle.pwrite(ctxt['buffer'], ctxt['file'], args.validate, True, 0)
     assert ret != -1
     handle.wait()
     end_time = time.time()
