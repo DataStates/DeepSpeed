@@ -1607,6 +1607,7 @@ class DeepSpeedEngine(Module):
                 )
             else:
                 log_dist(f'Creating fp16 optimizer with static loss scale: {self.loss_scale()}', ranks=[0])
+                timers = self.timers if self.wall_clock_breakdown() else NoopTimer()
                 optimizer = FP16_Optimizer(
                     optimizer,
                     deepspeed=self,
@@ -1614,6 +1615,7 @@ class DeepSpeedEngine(Module):
                     mpu=self.mpu,
                     clip_grad=clip_grad,
                     fused_adam_legacy=self.optimizer_legacy_fusion(),
+                    timers=timers,
                     has_moe_layers=self.has_moe_layers,
                 )
         else:
