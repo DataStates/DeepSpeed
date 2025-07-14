@@ -13,14 +13,11 @@ Functionality for swapping optimizer tensors to/from (NVMe) storage devices.
 #include "deepspeed_pin_tensor.h"
 #include <torch/torch.h> // Include PyTorch
 #include <chrono>
-#include <zstd.h>     // Include Zstd header
-#include "zstd_errors.h"
 #include <cstring>    // For memset
 #include <omp.h>      // OpenMP for parallelism
 #include <iostream>
 #include <cmath> // For std::isnan
 #define DIST_OPT_NUM_OMP_THREADS 16
-#define DIST_OPT_NUM_ZSTD_THREADS 8
 #define DIST_OPT_NUM_ALIGNMENT 16
 
 static std::unordered_map<std::string, std::vector<size_t>> compressedOffsets;
@@ -40,8 +37,6 @@ struct deepspeed_aio_handle_t {
     std::unique_ptr<struct deepspeed_pin_tensor_t> _pinned_tensor_mgr;
     bool _enable_compression = false;
     char* decomp_temp_buffer = nullptr;
-    std::vector<ZSTD_CCtx*> cctxs;
-    std::vector<ZSTD_DCtx*> dctxs;
     std::vector<char*> cBuffs;;
     size_t _max_cBuffSize = 0;
     size_t _largest_tensor_bytes = 0;

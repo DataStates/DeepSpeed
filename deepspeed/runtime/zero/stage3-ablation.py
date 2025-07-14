@@ -31,9 +31,7 @@ from deepspeed.checkpoint.constants import OPTIMIZER_STATE_DICT, FP32_FLAT_GROUP
 from deepspeed.accelerator import get_accelerator
 from deepspeed.utils import z3_leaf_parameter
 import numpy as np
-from nvidia import nvcomp
 import json
-from zipnn import ZipNN
 import fasteners
 
 
@@ -190,7 +188,6 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
         self.dist_opt_subgroup_to_id_map = {}
         self.dist_opt_my_rank =  dist.get_rank()
         self.dist_opt_grad_buffer = torch.Tensor()
-        self.dist_opt_try_nvcomp = False
         self.dist_opt_try_dir_sizes = False
 
         self.dist_opt_ratio = 2
@@ -630,8 +627,6 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
 
             swapper_type = PipelinedOptimizerSwapper if offload_optimizer_config.pipeline else PartitionedOptimizerSwapper
             
-            if "try_nvcomp" in nvme_swap_folder:
-                self.dist_opt_try_nvcomp = True
             if "try_dir_size" in nvme_swap_folder:
                 self.dist_opt_try_dir_sizes = True
 
@@ -1048,20 +1043,6 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
             if cur_device == 'cpu':
                 self.optimizer.param_groups[param_group_id]['params'] = [fp32_param]
                 cpu_loss = self.optimizer.step()
-                if self.dist_opt_try_nvcomp:
-                    p = fp32_param
-                    m = self.optimizer.state[fp32_param]['exp_avg']
-                    v = self.optimizer.state[fp32_param]['exp_avg_sq']
-
-                    if self.dist_opt_step_iter not in self.dist_opt_comp_ratio["p"]:
-                        self.dist_opt_comp_ratio["p"][self.dist_opt_step_iter] = []
-                        self.dist_opt_comp_ratio["m"][self.dist_opt_step_iter] = []
-                        self.dist_opt_comp_ratio["v"][self.dist_opt_step_iter] = []
-
-                    self.dist_opt_comp_ratio["p"][self.dist_opt_step_iter].append(self._comp_check(p))
-                    self.dist_opt_comp_ratio["m"][self.dist_opt_step_iter].append(self._comp_check(m))
-                    self.dist_opt_comp_ratio["v"][self.dist_opt_step_iter].append(self._comp_check(v))                    
-
                 self.optimizer.param_groups[param_group_id]['params'] = []
             else:
                 self.backup_optimizer.param_groups[param_group_id]['params'] = [fp32_param]
@@ -2145,42 +2126,6 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
             do_flush = False
         return do_flush
 
-    def _comp_check(self, data):
-        try:
-            og_data = data
-            data = nvcomp.as_array(data.detach().to(get_accelerator().device_name()))
-            algos = ["GDeflate", "ANS", "Zstd"]
-            res = {}
-            for algorithm in algos:
-                codec = nvcomp.Codec(algorithm=algorithm, bitstream_kind=nvcomp.BitstreamKind.NVCOMP_NATIVE)
-                comp_arr = codec.encode(data)
-                comp_start_time = time.time()
-                comp_ratio = comp_arr.buffer_size/data.buffer_size
-                comp_stop_time = time.time()
-                
-                decomp_start_time = time.time()
-                decomp_array = codec.decode(comp_arr)
-                decomp_stop_time = time.time()
-                res[algorithm] = {"cr": comp_ratio, "ct": comp_stop_time-comp_start_time, "dt": decomp_stop_time-decomp_start_time, "bytes": data.buffer_size}
-            
-            zpn = ZipNN(method="zstd", input_format="torch", bytearray_dtype='float32', threads=8)
-
-            comp_start_time = time.time()
-            comp_data = zpn.compress(og_data.detach().cpu())
-            comp_stop_time = time.time()
-
-
-            decomp_start_time = time.time()
-            decomp_data = zpn.decompress(comp_data)
-            decomp_stop_time = time.time()
-            comp_ratio = len(comp_data)/(og_data.element_size()*og_data.numel())
-            res["zipnn"] = {"cr": comp_ratio, "ct": comp_stop_time-comp_start_time, "dt": decomp_stop_time-decomp_start_time, "bytes": data.buffer_size}
-
-
-        except Exception as e:
-            print(f"Got error during compression: {e}")
-        return res
-
     def _optimizer_states_and_gradient_swap_out(self, sub_group_id, timer_names):
         param_length = self.fp16_partitioned_groups_flat_numel[sub_group_id]
         fp32_param_id = self.get_param_id(self.fp32_partitioned_groups_flat[sub_group_id])
@@ -2212,7 +2157,7 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
                 rank=self.dist_opt_my_rank)
             self.dist_opt_cached_subgroups[sub_group_id] = False
 
-            if self.dist_opt_step_iter >= 1 and (not self.dist_opt_try_nvcomp):
+            if self.dist_opt_step_iter >= 1:
                 orig_tensor_size = self.fp32_partitioned_groups_flat[sub_group_id].numel()*self.fp32_partitioned_groups_flat[sub_group_id].element_size()
                 if self.dist_opt_step_iter not in self.dist_opt_comp_ratio["p"]:
                     self.dist_opt_comp_ratio["p"][self.dist_opt_step_iter] = []
@@ -2422,14 +2367,10 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
         my_timers["time"] = time.time()- my_timers["time"]
 
         # print(f"COMP_RATIOS: ({json.dumps(self.dist_opt_comp_ratio)})")
-        if not self.dist_opt_try_nvcomp:
-            x = self.dist_opt_comp_ratio
-            print({k: {l: sum(i)/len(i) for l, i in v.items()} for k,v in x.items()})
-        else:
-            dist_opt_print_lock = fasteners.InterProcessLock('/dev/shm/dist_opt_print_lock.file')
-            dist_opt_print_lock.acquire()
-            print({self.dist_opt_my_rank: json.dumps(self.dist_opt_comp_ratio)})
-            dist_opt_print_lock.release()
+        dist_opt_print_lock = fasteners.InterProcessLock('/dev/shm/dist_opt_print_lock.file')
+        dist_opt_print_lock.acquire()
+        print({self.dist_opt_my_rank: json.dumps(self.dist_opt_comp_ratio)})
+        dist_opt_print_lock.release()
         if self.dist_opt_try_dir_sizes:
             dist.barrier()
             dist_opt_print_lock = fasteners.InterProcessLock('/dev/shm/dist_opt_print_lock.file')

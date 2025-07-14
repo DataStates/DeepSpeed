@@ -49,30 +49,8 @@ deepspeed_aio_handle_t::deepspeed_aio_handle_t(const int block_size,
         decomp_temp_buffer = static_cast<char*>(aligned_alloc(DIST_OPT_NUM_ALIGNMENT, _largest_tensor_bytes));
     }
 
-    for (int i=0; i< DIST_OPT_NUM_OMP_THREADS; i++) {
-        ZSTD_CCtx* cctx = ZSTD_createCCtx();
-        ZSTD_CCtx_setParameter(cctx, ZSTD_c_nbWorkers, DIST_OPT_NUM_ZSTD_THREADS); // ZSTD threads
-        ZSTD_CCtx_setParameter(cctx, ZSTD_c_compressionLevel, 1);         // Compression level
-        cctxs.push_back(cctx);
-
-        ZSTD_DCtx* dctx = ZSTD_createDCtx();
-        dctxs.push_back(dctx);
-    }
-
-
     _largest_tensor_bytes = ((_largest_tensor_bytes + DIST_OPT_NUM_OMP_THREADS - 1) / DIST_OPT_NUM_OMP_THREADS)* DIST_OPT_NUM_OMP_THREADS;
     size_t chunkSize = _largest_tensor_bytes / DIST_OPT_NUM_OMP_THREADS;
-    cBuffs.resize(DIST_OPT_NUM_OMP_THREADS);
-    #pragma omp parallel num_threads(DIST_OPT_NUM_OMP_THREADS)
-    {
-        int thread_id = omp_get_thread_num();
-        // Allocate a temporary buffer for each thread's compressed output
-        size_t cBuffSize = ZSTD_compressBound(chunkSize);
-        if (cBuffSize > _max_cBuffSize)
-            _max_cBuffSize = cBuffSize;
-        void* cBuff = aligned_alloc(DIST_OPT_NUM_ALIGNMENT, cBuffSize);
-        cBuffs[thread_id] = static_cast<char*>(cBuff);
-    }
 }
 
 deepspeed_aio_handle_t::~deepspeed_aio_handle_t()
@@ -80,13 +58,6 @@ deepspeed_aio_handle_t::~deepspeed_aio_handle_t()
     _stop_threads();
     for (auto& thr : _threads) { thr.join(); }
     free(decomp_temp_buffer);
-
-    for (int i=0; i< DIST_OPT_NUM_OMP_THREADS; i++) {
-        ZSTD_freeCCtx(cctxs[i]);
-        ZSTD_freeDCtx(dctxs[i]);
-        free(cBuffs[i]);
-    }
-
 }
 
 const int deepspeed_aio_handle_t::get_block_size() const
@@ -383,53 +354,6 @@ uint8_t* deepspeed_aio_handle_t::compressTensor(const torch::Tensor& buffer, siz
                 std::cerr << "Failed to allocate memory for thread " << thread_id << std::endl;
             }
         }
-
-        // Create compression context for each thread
-        ZSTD_CCtx* cctx = cctxs[thread_id];
-        // Compress the chunk
-        size_t compressedSize = ZSTD_compress2(
-            cctx,
-            static_cast<char*>(cBuff),
-            _max_cBuffSize,
-            static_cast<char*>(buffer.data_ptr()) + startIdx , // Pointer to the tensor data
-            (endIdx - startIdx)
-        );
-
-        if (ZSTD_isError(compressedSize)) {
-            #pragma omp critical
-            {
-                std::cerr << "Compression error in thread " << thread_id << ": " 
-                          << ZSTD_getErrorName(compressedSize) << std::endl;
-            }
-            ZSTD_freeCCtx(cctx);
-            free(cBuff);
-        }
-
-        compressedOffsets[filename][thread_id] = compressedSize;
-
-        // Sequentially write the compressed chunk to the final buffer
-        size_t writeOffset = 0;
-        #pragma omp barrier
-        {
-            for (int i = 0; i < thread_id; ++i) {
-                writeOffset += compressedOffsets[filename][i];
-            }
-
-            if (thread_id == 0) {
-                finalCompressedSize = 0;
-                for (size_t a: compressedOffsets[filename])
-                    finalCompressedSize += a;
-                compressedOffsets[filename][DIST_OPT_NUM_OMP_THREADS] = finalCompressedSize;
-            }
-        }
-        #pragma omp barrier
-        if (finalCompressedSize < numElements) {
-            memcpy(finalCompressedBuffer + writeOffset, cBuff, compressedSize);
-            compressedOffsets[filename][thread_id] = writeOffset;
-        } else {
-            compressedOffsets[filename][thread_id] = 0;
-        }
-        // free(cBuff);
     }
 
     // torch::Tensor decomp_buffer_copy = torch::zeros_like(buffer);
@@ -480,42 +404,6 @@ size_t deepspeed_aio_handle_t::decompressTensor(torch::Tensor& decompressedBuffe
         // Allocate a temporary buffer for decompression
         uint8_t* dBuff = static_cast<uint8_t*>(decompressedBuffer.data_ptr()) + startIdx;
         size_t dBuffSize = (endIdx - startIdx);
-
-        // Create decompression context for each thread
-        ZSTD_DCtx* dctx = dctxs[thread_id];
-
-        // size_t decompressedSize = ZSTD_getFrameContentSize(static_cast<char*>(compressedBuffer) + readOffset, compressedSize);
-        // #pragma omp critical 
-        // {
-        //     std::cout << filename << " decompression thread " << thread_id << " should be " << dBuffSize << " and headers says to get decomp of  " << decompressedSize <<  std::endl;    
-        // }
-        
-
-        // Decompress the chunk
-        size_t decompressedSize = ZSTD_decompressDCtx(
-            dctx,
-            dBuff,
-            dBuffSize,
-            compressedBuffer + readOffset,
-            compressedSize
-        );
-        totalSize.fetch_add(decompressedSize);
-
-        if (ZSTD_isError(decompressedSize)) {
-            #pragma omp critical
-            {
-                std::cerr << "Decompression error in thread " << thread_id << ": "
-                          << ZSTD_getErrorName(decompressedSize) << std::endl;
-            }
-        }
-
-        if (decompressedSize != dBuffSize) {
-            #pragma omp critical
-            {
-                std::cerr << "Thread " << thread_id << " decompressed size mismatch: "
-                          << decompressedSize << " != " << dBuffSize << std::endl;
-            }
-        }
     }
     
     
