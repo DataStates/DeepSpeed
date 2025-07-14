@@ -188,7 +188,6 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
         self.dist_opt_subgroup_to_id_map = {}
         self.dist_opt_my_rank =  dist.get_rank()
         self.dist_opt_grad_buffer = torch.Tensor()
-        self.dist_opt_try_dir_sizes = False
 
         self.dist_opt_ratio = 2
         self.dist_opt_grad_skip = False
@@ -626,9 +625,6 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
                 logger.info(f'Tensor Swapping: Adding optimizer tensors at {nvme_swap_folder}')
 
             swapper_type = PipelinedOptimizerSwapper if offload_optimizer_config.pipeline else PartitionedOptimizerSwapper
-            
-            if "try_dir_size" in nvme_swap_folder:
-                self.dist_opt_try_dir_sizes = True
 
             swapper = swapper_type(swap_config=offload_optimizer_config,
                                                 aio_config=aio_config,
@@ -2371,13 +2367,6 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
         dist_opt_print_lock.acquire()
         print({self.dist_opt_my_rank: json.dumps(self.dist_opt_comp_ratio)})
         dist_opt_print_lock.release()
-        if self.dist_opt_try_dir_sizes:
-            dist.barrier()
-            dist_opt_print_lock = fasteners.InterProcessLock('/dev/shm/dist_opt_print_lock.file')
-            dist_opt_print_lock.acquire()
-            print("-> sizes: ", json.dumps({self.dist_opt_my_rank: self.fp16_partitioned_groups_flat_numel}))
-            dist_opt_print_lock.release()
-            dist.barrier()
         print(f"----- Rank [{self.dist_opt_my_rank}] took {my_timers}")
         # dist.barrier()
 
