@@ -862,6 +862,9 @@ class DeepSpeedConfig(object):
         self.nebula_config = DeepSpeedNebulaConfig(param_dict)
         self.datastates_config = DeepSpeedDataStatesConfig(param_dict)
         self.checkpoint_config = get_checkpoint_config(param_dict)
+        self.torchsnapshot_config = False
+        if "torchsnapshot_ckpt" in param_dict.keys():
+            self.torchsnapshot_config = True
 
         self.weight_quantization_config = WeightQuantConfig(
             **param_dict['weight_quantization']) if 'weight_quantization' in param_dict else None

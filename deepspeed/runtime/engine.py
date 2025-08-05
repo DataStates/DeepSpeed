@@ -1190,6 +1190,15 @@ class DeepSpeedEngine(Module):
                     f"The datastates-llm checkpoint engine was not found! Will fall back to torch.save. Details: {err}"
                 )
 
+        if self._config is not None and self._config.torchsnapshot_config:
+            try:
+                from deepspeed.runtime.checkpoint_engine.torchsnapshot_checkpoint_engine import TorchSnapshotCheckpointEngine
+                self.checkpoint_engine = TorchSnapshotCheckpointEngine()
+            except ImportError as err:
+                raise Exception(
+                    f"The TorchSnapshot checkpoint engine was not found! Will fall back to torch.save. Details: {err}"
+                )
+
         dp_rank = groups._get_sequence_data_parallel_rank()
         rank = self.local_rank if self.use_node_local_storage() else dp_rank
 
