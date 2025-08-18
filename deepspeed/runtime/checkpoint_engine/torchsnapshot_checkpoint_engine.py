@@ -32,10 +32,13 @@ class TorchSnapshotCheckpointEngine(CheckpointEngine):
         return None
 
     def load(self, path: str, map_location=None):
-        logger.info(f"[TorchSnapshot] Loading checkpoint from {path}...")
-        partition = Snapshot.load(path=path, map_location=map_location)
-        logger.info(f"[TorchSnapshot] Loaded checkpoint from {path}.")
-        return partition
+        snapshot = Snapshot(path=path)
+        logger.info(f"loading checkpoint {path}")
+        a = StateDict(ckpt={})
+        snapshot.restore(app_state=a)
+        res = a["app_state"].data['ckpt']
+        logger.info('Restored state dict keys: {}'.format(res.keys()))
+        return res
 
     def commit(self, tag):
         logger.info(f"[TorchSnapshot] Checkpoint {tag} is ready now!")
