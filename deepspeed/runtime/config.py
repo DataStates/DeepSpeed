@@ -866,6 +866,10 @@ class DeepSpeedConfig(object):
         if "torchsnapshot_ckpt" in param_dict.keys():
             self.torchsnapshot_config = True
 
+        self.none_checkpointing_config = False
+        if "none_ckpt" in param_dict.keys():
+            self.none_checkpointing_config = True
+
         self.weight_quantization_config = WeightQuantConfig(
             **param_dict['weight_quantization']) if 'weight_quantization' in param_dict else None
 

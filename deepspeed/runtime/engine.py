@@ -1199,6 +1199,10 @@ class DeepSpeedEngine(Module):
                     f"The TorchSnapshot checkpoint engine was not found! Will fall back to torch.save. Details: {err}"
                 )
 
+        if self._config is not None and self._config.none_checkpointing_config:
+            from deepspeed.runtime.checkpoint_engine.none_checkpoint_engine import NoneCheckpointEngine
+            self.checkpoint_engine = NoneCheckpointEngine()
+
         dp_rank = groups._get_sequence_data_parallel_rank()
         rank = self.local_rank if self.use_node_local_storage() else dp_rank
 
