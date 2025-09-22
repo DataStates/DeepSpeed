@@ -35,7 +35,7 @@ class TorchSnapshotCheckpointEngine(CheckpointEngine):
     def load(self, path: str, map_location=None):
         snapshot = Snapshot(path=path)
         logger.info(f"loading checkpoint {path}")
-        a = StateDict(ckpt={})
+        a = {"app_state": StateDict(ckpt={})}
         snapshot.restore(app_state=a)
         res = a["app_state"].data['ckpt']
         logger.info('Restored state dict keys: {}'.format(res.keys()))
