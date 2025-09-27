@@ -1848,6 +1848,7 @@ class DeepSpeedEngine(Module):
                 optimizer = Stage3ZeroOptimizer(
                     self.module,
                     optimizer,
+                    self.param_names,
                     timers=timers,
                     ds_config=self.config,
                     static_loss_scale=self.loss_scale(),
@@ -1896,6 +1897,7 @@ class DeepSpeedEngine(Module):
         model_dtype, gradient_accumulation_dtype = self.get_data_types()
         optimizer = MiCS_Optimizer(self.module,
                                    basic_optimizer,
+                                   self.param_names,
                                    timers=timers,
                                    ds_config=self.config,
                                    static_loss_scale=self.loss_scale(),
@@ -3026,10 +3028,7 @@ class DeepSpeedEngine(Module):
             mp_rank_str = f"{mp_rank:02d}"
 
         if self.zero_optimization_partition_weights():
-            if self.load_universal_checkpoint():
-                filename = "zero_pp_rank_0"
-            else:
-                filename = "zero_pp_rank_{}".format(dist.get_rank(group=self.optimizer.dp_process_group))
+            filename = "zero_pp_rank_{}".format(dist.get_rank(group=self.optimizer.dp_process_group))
             ckpt_name = os.path.join(
                 checkpoints_path,
                 str(tag),
@@ -3069,7 +3068,10 @@ class DeepSpeedEngine(Module):
 
         ckpt_files = glob.glob(ckpt_file_pattern)
         ckpt_files.sort()
-        return ckpt_files
+        if self.load_universal_checkpoint():
+            return [ckpt_files[0]]
+        else:
+            return ckpt_files
 
     def load_checkpoint(self,
                         load_dir,
