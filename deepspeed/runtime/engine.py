@@ -1196,8 +1196,7 @@ class DeepSpeedEngine(Module):
                 self.checkpoint_engine = TorchSnapshotCheckpointEngine()
             except ImportError as err:
                 raise Exception(
-                    f"The TorchSnapshot checkpoint engine was not found! Will fall back to torch.save. Details: {err}"
-                )
+                    f"The TorchSnapshot checkpoint engine was not found! Will fall back to torch.save. Details: {err}")
 
         if self._config is not None and self._config.none_checkpointing_config:
             from deepspeed.runtime.checkpoint_engine.none_checkpoint_engine import NoneCheckpointEngine
@@ -2675,6 +2674,10 @@ class DeepSpeedEngine(Module):
         # Update the model when we reach gradient accumulation boundaries
         if self.is_gradient_accumulation_boundary():
             self.gas_boundary_ctr += 1
+            try:
+                self.checkpoint_engine.wait()
+            except Exception as exc:
+                logger.error(f"Error during optimizer wait step: {exc}")
 
             if self.checkpoint_engine.is_decoupled():
                 self._commit_decoupled_checkpoint()
