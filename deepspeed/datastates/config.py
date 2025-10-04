@@ -6,6 +6,10 @@
 # DeepSpeed Team
 
 from deepspeed.runtime.config_utils import DeepSpeedConfigObject
+import copy
+
+DATASTATES_CHECKPOINTING = "datastates_ckpt"
+DATASTATES_CHECKPOINTING_ENABLED = False
 
 
 class DeepSpeedDataStatesConfig(DeepSpeedConfigObject):
@@ -13,9 +17,5 @@ class DeepSpeedDataStatesConfig(DeepSpeedConfigObject):
     def __init__(self, param_dict):
         super(DeepSpeedDataStatesConfig, self).__init__()
 
-        self.enabled = None
-        self.config = {}
-
-        if "datastates_ckpt" in param_dict.keys():
-            self.enabled = True
-            self.config = param_dict["datastates_ckpt"]
+        self.enabled = param_dict.get(DATASTATES_CHECKPOINTING, DATASTATES_CHECKPOINTING_ENABLED) is not False
+        self.config = copy.deepcopy(param_dict.get(DATASTATES_CHECKPOINTING, None))

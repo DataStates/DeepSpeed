@@ -59,6 +59,5 @@ class CheckpointEngine(ABC):
     def cleanup(self):
         pass
 
-    def wait(self):
-        # To wait in asynchronous checkpoint engines (e.g. DataStates-LLM) for the previous snapshot to finish
-        pass
+    def preserves_storage_sharing(self):
+        return True

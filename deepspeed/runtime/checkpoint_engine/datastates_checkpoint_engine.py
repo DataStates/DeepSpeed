@@ -5,20 +5,25 @@
 
 # DeepSpeed Team
 
-from deepspeed.utils import log_dist
 from deepspeed.runtime.checkpoint_engine.checkpoint_engine import \
-    CheckpointEngine
-from datastates.llm import Checkpointing
+    CheckpointEngine, CheckpointCommitInfo
+from datastates import CheckpointEngine as DataStatesEngine
+
+ENGINE_NAME = "DataStatesCheckpointEngine"
 
 
 class DataStatesCheckpointEngine(CheckpointEngine):
 
     def __init__(self, deepspeed_config, rank):
         super().__init__(deepspeed_config)
-        self.ckpt_engine = Checkpointing(deepspeed_config, rank)
+        self.commit_info = None
+        self.ckpt_engine = DataStatesEngine(deepspeed_config, rank)
 
-    def create(self, tag):
-        log_dist(f"[DataStates] Checkpoint {tag} is about to be saved!", ranks=[0])
+    def __del__(self):
+        self.cleanup()
+
+    def create(self, info: CheckpointCommitInfo):
+        self.commit_info = info
         return None
 
     def save(self, state_dict, path: str):
@@ -27,8 +32,18 @@ class DataStatesCheckpointEngine(CheckpointEngine):
     def load(self, path: str, map_location=None):
         return self.ckpt_engine.load(path, map_location)
 
-    def commit(self, tag):
-        return self.ckpt_engine.commit(tag)
+    def commit(self, info: CheckpointCommitInfo):
+        assert info == self.commit_info
+        self.ckpt_engine.wait()
+        return self.ckpt_engine.commit(info.tag)
 
-    def wait(self):
-        return self.ckpt_engine.wait()
+    def cleanup(self):
+        self.commit(self.commit_info)
+        self.ckpt_engine.wait(True)
+        del self.ckpt_engine
+
+    def is_decoupled(self):
+        return True
+
+    def preserves_storage_sharing(self):
+        return False

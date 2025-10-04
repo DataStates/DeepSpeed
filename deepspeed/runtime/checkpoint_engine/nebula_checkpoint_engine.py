@@ -11,7 +11,6 @@ from deepspeed.runtime.checkpoint_engine.checkpoint_engine import \
     CheckpointEngine, CheckpointCommitInfo
 from deepspeed.utils import logger, log_dist
 from deepspeed.nebula.constants import *
-from deepspeed.checkpoint.utils import clone_tensors_for_torch_save
 
 
 def _get_tag_from_path(path):
