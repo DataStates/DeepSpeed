@@ -3,19 +3,19 @@
 
 # DeepSpeed Team
 
-import torch
 from deepspeed.utils import logger, log_dist
 from deepspeed.runtime.checkpoint_engine.checkpoint_engine import \
-    CheckpointEngine
-from deepspeed.checkpoint.utils import clone_tensors_for_torch_save
+    CheckpointCommitInfo, CheckpointEngine
 from torchsnapshot import Snapshot, StateDict
 import os, time
+
 
 class TorchSnapshotCheckpointEngine(CheckpointEngine):
 
     def __init__(self, config_params=None):
         super().__init__(config_params)
         self.snapshot = []
+        self.commit_info = None
 
     def create(self, tag):
         log_dist(f"[TorchSnapshot] Checkpoint {tag} is about to be saved!", ranks=[0])
@@ -41,8 +41,13 @@ class TorchSnapshotCheckpointEngine(CheckpointEngine):
         logger.info('Restored state dict keys: {}'.format(res.keys()))
         return res
 
-    def commit(self, tag):
-        logger.info(f"[TorchSnapshot] Checkpoint {tag} is ready now!")
+    def commit(self, info: CheckpointCommitInfo):
+        if info is None:
+            return
+        logger.info(f"[TorchSnapshot] Checkpoint {info.tag} is ready now!")
+        assert info == self.commit_info
+        self.wait()
+        self.commit_info = None
         return True
 
     def wait(self):
@@ -51,12 +56,25 @@ class TorchSnapshotCheckpointEngine(CheckpointEngine):
         for s in self.snapshot:
             x = s.wait()
             assert s.done() == True, "Snapshot should be done after wait"
-            snapshots.append(x) # Append the snapshot to keep temporary reference
+            snapshots.append(x)  # Append the snapshot to keep temporary reference
         self.snapshot = []
         logger.info(f"[TorchSnapshot] Waited for all snapshots to complete in {time.time() - t:.6f}s")
         del snapshots
         return True
-    
+
     def __del__(self):
         self.wait()
         return True
+
+    def cleanup(self):
+        self.wait()
+        return True
+
+    def get_commit_info(self):
+        return self.commit_info
+
+    def is_decoupled(self):
+        return True
+
+    def preserves_storage_sharing(self):
+        return False

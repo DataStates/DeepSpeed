@@ -33,10 +33,7 @@ class DataStatesCheckpointEngine(CheckpointEngine):
         return None
 
     def save(self, state_dict, path: str):
-        t = time.time()
-        self.ckpt_engine.save(state_dict, path)
-        logger.info(f"[DataStates] CkptTime {path} {time.time()-t}.")
-        return None
+        return self.ckpt_engine.save(state_dict, path)
 
     def load(self, path: str, map_location=None):
         return self.ckpt_engine.load(path, map_location)

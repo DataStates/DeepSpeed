@@ -2643,6 +2643,22 @@ class DeepSpeedEngine(Module):
         self.global_steps += 1
         self.global_samples += self.train_batch_size()
 
+    def _commit_decoupled_checkpoint(self):
+        assert self.checkpoint_engine.is_decoupled(), \
+            f'{self.checkpoint_engine} is not a Decoupled Checkpoint Engine'
+
+        commit_info = self.checkpoint_engine.get_commit_info()
+        if commit_info is None:
+            return
+
+        self.checkpoint_engine.commit(commit_info)
+
+        if self.global_rank == 0 and commit_info.save_latest:
+            with open(os.path.join(commit_info.save_dir, 'latest'), 'w') as fd:
+                fd.write(commit_info.tag)
+
+        dist.barrier()
+
     def step(self, lr_kwargs=None):
         r"""Execute the weight update step after forward and backward propagation
         on effective_train_batch.
@@ -2674,10 +2690,8 @@ class DeepSpeedEngine(Module):
         # Update the model when we reach gradient accumulation boundaries
         if self.is_gradient_accumulation_boundary():
             self.gas_boundary_ctr += 1
-            try:
-                self.checkpoint_engine.wait()
-            except Exception as exc:
-                logger.error(f"Error during optimizer wait step: {exc}")
+            if self.checkpoint_engine.is_decoupled():
+                self._commit_decoupled_checkpoint()
 
             if self.checkpoint_engine.is_decoupled():
                 self._commit_decoupled_checkpoint()
@@ -3633,7 +3647,6 @@ class DeepSpeedEngine(Module):
 
         if tag is None:
             tag = f"global_step{self.global_steps}"
-
         # Ensure tag is a string
         tag = str(tag)
         commit_info = CheckpointCommitInfo(tag=tag, save_dir=save_dir, save_latest=save_latest)
