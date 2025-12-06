@@ -1180,28 +1180,6 @@ class DeepSpeedEngine(Module):
                                                           has_moe_layers=self.has_moe_layers,
                                                           optimize_dp_state=optimize_dp_state)
 
-        if self._config is not None and self._config.datastates_config.enabled:
-            try:
-                from deepspeed.runtime.checkpoint_engine.datastates_checkpoint_engine import DataStatesCheckpointEngine
-                self.checkpoint_engine = DataStatesCheckpointEngine(deepspeed_config=self._config,
-                                                                    rank=dist.get_rank())
-            except ImportError as err:
-                raise Exception(
-                    f"The datastates-llm checkpoint engine was not found! Will fall back to torch.save. Details: {err}"
-                )
-
-        if self._config is not None and self._config.torchsnapshot_config:
-            try:
-                from deepspeed.runtime.checkpoint_engine.torchsnapshot_checkpoint_engine import TorchSnapshotCheckpointEngine
-                self.checkpoint_engine = TorchSnapshotCheckpointEngine()
-            except ImportError as err:
-                raise Exception(
-                    f"The TorchSnapshot checkpoint engine was not found! Will fall back to torch.save. Details: {err}")
-
-        if self._config is not None and self._config.none_checkpointing_config:
-            from deepspeed.runtime.checkpoint_engine.none_checkpoint_engine import NoneCheckpointEngine
-            self.checkpoint_engine = NoneCheckpointEngine()
-
         dp_rank = groups._get_sequence_data_parallel_rank()
         rank = self.local_rank if self.use_node_local_storage() else dp_rank
 
@@ -2642,22 +2620,6 @@ class DeepSpeedEngine(Module):
         self.losses = None
         self.global_steps += 1
         self.global_samples += self.train_batch_size()
-
-    def _commit_decoupled_checkpoint(self):
-        assert self.checkpoint_engine.is_decoupled(), \
-            f'{self.checkpoint_engine} is not a Decoupled Checkpoint Engine'
-
-        commit_info = self.checkpoint_engine.get_commit_info()
-        if commit_info is None:
-            return
-
-        self.checkpoint_engine.commit(commit_info)
-
-        if self.global_rank == 0 and commit_info.save_latest:
-            with open(os.path.join(commit_info.save_dir, 'latest'), 'w') as fd:
-                fd.write(commit_info.tag)
-
-        dist.barrier()
 
     def step(self, lr_kwargs=None):
         r"""Execute the weight update step after forward and backward propagation

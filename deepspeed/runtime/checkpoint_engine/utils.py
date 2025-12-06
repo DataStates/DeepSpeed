@@ -45,4 +45,16 @@ def create_checkpoint_engine(config_params, groups, zero_stage, has_moe_layers, 
                 )
                 return TorchCheckpointEngine(config_params)
 
+        if config_params.torchsnapshot_config:
+            try:
+                from deepspeed.runtime.checkpoint_engine.torchsnapshot_checkpoint_engine import TorchSnapshotCheckpointEngine
+                return TorchSnapshotCheckpointEngine()
+            except ImportError as err:
+                raise Exception(
+                    f"The TorchSnapshot checkpoint engine was not found! Will fall back to torch.save. Details: {err}")
+
+        if config_params.none_checkpointing_config:
+            from deepspeed.runtime.checkpoint_engine.none_checkpoint_engine import NoneCheckpointEngine
+            return NoneCheckpointEngine()
+
     return TorchCheckpointEngine(config_params)
